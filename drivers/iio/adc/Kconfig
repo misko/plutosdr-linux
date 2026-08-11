@@ -370,6 +370,20 @@ config ADM1177
 	  To compile this driver as a module, choose M here: the
 	  module will be called adm1177.
 
+config ADI_TANDEM_AGC
+	tristate "Analog Devices Tandem AGC controller"
+	depends on OF
+	help
+	  Register interface for the FPGA block that owns the AD9361 CTRL_IN
+	  pins and steps the RX1 and RX2 gain indices together.
+
+	  The block carries no channels; it is registered with IIO so that its
+	  registers are reachable through libiio, which is what lets a host
+	  control it remotely instead of only from the radio's own processor.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called adi_tandem_agc.
+
 config ADI_AXI_ADC
 	tristate "Analog Devices Generic AXI ADC IP core driver"
 	select IIO_BUFFER
