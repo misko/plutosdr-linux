@@ -274,7 +274,8 @@
 		adi,tx-rf-port-input-select-lock-enable;
 
 		//adi,update-tx-gain-in-alert-enable;
-		adi,tx-attenuation-mdB = <10000>;
+		/* Fail closed: initialize every active TX path at -80 dB. */
+		adi,tx-attenuation-mdB = <80000>;
 		adi,tx-lo-powerdown-managed-enable;
 
 		adi,rf-rx-bandwidth-hz = <18000000>;

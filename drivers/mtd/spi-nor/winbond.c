@@ -11,13 +11,18 @@
 #define SPINOR_OP_WINBOND_READ_UID	0x4b
 #define WINBOND_UID_LEN			8
 #define WINBOND_UID_DUMMY_BYTES		4
+#define WINBOND_UID_4B_MODE_DUMMY_BYTES	5
 
 static int winbond_read_unique_id(struct spi_nor *nor, u8 *buf, size_t len)
 {
+	u8 dummy_bytes = nor->addr_width == 4 &&
+			 !(nor->flags & SNOR_F_4B_OPCODES) ?
+			 WINBOND_UID_4B_MODE_DUMMY_BYTES :
+			 WINBOND_UID_DUMMY_BYTES;
 	struct spi_mem_op op = SPI_MEM_OP(
 		SPI_MEM_OP_CMD(SPINOR_OP_WINBOND_READ_UID, 1),
 		SPI_MEM_OP_NO_ADDR,
-		SPI_MEM_OP_DUMMY(WINBOND_UID_DUMMY_BYTES, 1),
+		SPI_MEM_OP_DUMMY(dummy_bytes, 1),
 		SPI_MEM_OP_DATA_IN(len, buf, 1));
 
 	if (len != WINBOND_UID_LEN)
@@ -40,11 +45,12 @@ w25q256_post_bfpt_fixups(struct spi_nor *nor,
 	 * version: only JV has JESD216A compliant structure (version 5).
 	 */
 	if (bfpt_header->major == SFDP_JESD216_MAJOR &&
-	    bfpt_header->minor == SFDP_JESD216A_MINOR) {
+	    bfpt_header->minor == SFDP_JESD216A_MINOR)
 		nor->flags |= SNOR_F_4B_OPCODES;
-		nor->params->unique_id_len = WINBOND_UID_LEN;
-		nor->params->read_unique_id = winbond_read_unique_id;
-	}
+
+	/* Opcode 4Bh exposes a factory-programmed UID on both FV and JV. */
+	nor->params->unique_id_len = WINBOND_UID_LEN;
+	nor->params->read_unique_id = winbond_read_unique_id;
 
 	return 0;
 }
