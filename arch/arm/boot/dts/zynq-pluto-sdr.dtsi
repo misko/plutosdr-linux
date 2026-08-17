@@ -21,9 +21,12 @@
 		#size-cells = <1>;
 		ranges;
 
-		ramoops@1ff00000 {
+		/* Keep reset evidence below the 0x0f000000 FPGA load address and
+		 * away from U-Boot's high-memory relocation arena.
+		 */
+		ramoops@ef00000 {
 			compatible = "ramoops";
-			reg = <0x1ff00000 0x00100000>;
+			reg = <0x0ef00000 0x00100000>;
 			record-size = <0x00040000>;
 			console-size = <0x00080000>;
 			pmsg-size = <0x00040000>;
