@@ -16,6 +16,20 @@
 		reg = <0x00000000 0x20000000>;
 	};
 
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		ramoops@1ff00000 {
+			compatible = "ramoops";
+			reg = <0x1ff00000 0x00100000>;
+			record-size = <0x00040000>;
+			console-size = <0x00080000>;
+			pmsg-size = <0x00040000>;
+		};
+	};
+
 	chosen {
 		stdout-path = "/amba@0/uart@E0001000";
 	};

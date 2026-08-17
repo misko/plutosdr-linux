@@ -252,6 +252,8 @@ struct spi_nor_otp {
  * @erase_map:		the erase map parsed from the SFDP Sector Map Parameter
  *                      Table.
  * @otp_info:		describes the OTP regions.
+ * @unique_id_len:	length in bytes of the factory-programmed unique ID.
+ * @read_unique_id:	reads the factory-programmed unique ID.
  * @octal_dtr_enable:	enables SPI NOR octal DTR mode.
  * @quad_enable:	enables SPI NOR quad mode.
  * @set_4byte_addr_mode: puts the SPI NOR in 4 byte addressing mode.
@@ -278,6 +280,8 @@ struct spi_nor_flash_parameter {
 
 	struct spi_nor_erase_map        erase_map;
 	struct spi_nor_otp		otp;
+	size_t			unique_id_len;
+	int (*read_unique_id)(struct spi_nor *nor, u8 *buf, size_t len);
 
 	int (*octal_dtr_enable)(struct spi_nor *nor, bool enable);
 	int (*quad_enable)(struct spi_nor *nor);

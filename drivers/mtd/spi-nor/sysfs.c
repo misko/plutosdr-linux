@@ -62,8 +62,39 @@ static ssize_t sfdp_read(struct file *filp, struct kobject *kobj,
 }
 static BIN_ATTR_RO(sfdp, 0);
 
+static ssize_t unique_id_read(struct file *filp, struct kobject *kobj,
+			      struct bin_attribute *bin_attr, char *buf,
+			      loff_t off, size_t count)
+{
+	struct spi_device *spi = to_spi_device(kobj_to_dev(kobj));
+	struct spi_mem *spimem = spi_get_drvdata(spi);
+	struct spi_nor *nor = spi_mem_get_drvdata(spimem);
+	u8 unique_id[32];
+	int ret;
+
+	if (!nor->params->read_unique_id ||
+	    !nor->params->unique_id_len ||
+	    nor->params->unique_id_len > sizeof(unique_id))
+		return -EOPNOTSUPP;
+
+	ret = spi_nor_lock_and_prep(nor);
+	if (ret)
+		return ret;
+
+	ret = nor->params->read_unique_id(nor, unique_id,
+					 nor->params->unique_id_len);
+	spi_nor_unlock_and_unprep(nor);
+	if (ret)
+		return ret;
+
+	return memory_read_from_buffer(buf, count, &off, unique_id,
+				       nor->params->unique_id_len);
+}
+static BIN_ATTR_RO(unique_id, 0);
+
 static struct bin_attribute *spi_nor_sysfs_bin_entries[] = {
 	&bin_attr_sfdp,
+	&bin_attr_unique_id,
 	NULL
 };
 
@@ -75,6 +106,9 @@ static umode_t spi_nor_sysfs_is_bin_visible(struct kobject *kobj,
 	struct spi_nor *nor = spi_mem_get_drvdata(spimem);
 
 	if (attr == &bin_attr_sfdp && nor->sfdp)
+		return 0444;
+	if (attr == &bin_attr_unique_id && nor->params->read_unique_id &&
+	    nor->params->unique_id_len)
 		return 0444;
 
 	return 0;
