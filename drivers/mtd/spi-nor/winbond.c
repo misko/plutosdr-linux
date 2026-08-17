@@ -49,15 +49,23 @@ w25q256_post_bfpt_fixups(struct spi_nor *nor,
 	    bfpt_header->minor == SFDP_JESD216A_MINOR)
 		nor->flags |= SNOR_F_4B_OPCODES;
 
-	/* Opcode 4Bh exposes a factory-programmed UID on both FV and JV. */
+	return 0;
+}
+
+static void w25q256_post_sfdp_fixups(struct spi_nor *nor)
+{
+	/*
+	 * Opcode 4Bh exposes a factory-programmed UID on both FV and JV.
+	 * Install this in post_sfdp rather than post_bfpt: the Zynq QSPI path
+	 * deliberately skips SFDP/BFPT parsing, but post_sfdp is still called.
+	 */
 	nor->params->unique_id_len = WINBOND_UID_LEN;
 	nor->params->read_unique_id = winbond_read_unique_id;
-
-	return 0;
 }
 
 static struct spi_nor_fixups w25q256_fixups = {
 	.post_bfpt = w25q256_post_bfpt_fixups,
+	.post_sfdp = w25q256_post_sfdp_fixups,
 };
 
 static const struct flash_info winbond_parts[] = {
