@@ -84,8 +84,13 @@ static ssize_t unique_id_read(struct file *filp, struct kobject *kobj,
 	ret = nor->params->read_unique_id(nor, unique_id,
 					 nor->params->unique_id_len);
 	spi_nor_unlock_and_unprep(nor);
-	if (ret)
+	if (ret) {
+		dev_err(nor->dev, "unique ID read failed: %d\n", ret);
 		return ret;
+	}
+
+	dev_info(nor->dev, "unique ID read returned %*phN\n",
+		 nor->params->unique_id_len, unique_id);
 
 	return memory_read_from_buffer(buf, count, &off, unique_id,
 				       nor->params->unique_id_len);

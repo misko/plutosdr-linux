@@ -28,6 +28,7 @@ static int winbond_read_unique_id(struct spi_nor *nor, u8 *buf, size_t len)
 	if (len != WINBOND_UID_LEN)
 		return -EINVAL;
 
+	spi_nor_spimem_setup_op(nor, &op, nor->reg_proto);
 	return spi_mem_exec_op(nor->spimem, &op);
 }
 
