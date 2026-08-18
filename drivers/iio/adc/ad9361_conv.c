@@ -764,7 +764,9 @@ EXPORT_SYMBOL(ad9361_register_axi_converter);
 struct ad9361_rf_phy* ad9361_spi_to_phy(struct spi_device *spi)
 {
 	struct axiadc_converter *conv = spi_get_drvdata(spi);
-	return conv->phy;
+
+	/* The consumer may probe before the converter has populated drvdata. */
+	return conv ? conv->phy : NULL;
 }
 EXPORT_SYMBOL(ad9361_spi_to_phy);
 
