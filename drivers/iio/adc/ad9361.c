@@ -8263,7 +8263,15 @@ static int ad9361_phy_write_raw(struct iio_dev *indio_dev,
 		return -EINVAL;
 
 	mutex_lock(&phy->lock);
-	if (phy->tandem_owner) {
+	/*
+	 * Tandem owns the RX gain machinery, not the TX attenuators.  Keeping
+	 * TX hardware-gain writes available lets a separately safety-gated
+	 * transmitter provide a bounded calibration stimulus without changing
+	 * any state covered by the tandem snapshot.  All other raw writes can
+	 * invalidate the lease and remain interlocked.
+	 */
+	if (phy->tandem_owner &&
+	    !(mask == IIO_CHAN_INFO_HARDWAREGAIN && chan->output)) {
 		ret = -EBUSY;
 		goto out;
 	}
