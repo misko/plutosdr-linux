@@ -521,7 +521,8 @@ static ssize_t tandem_attr_show(struct device *dev,
 		value = TANDEM_REQUIRED_FEATURES;
 		break;
 	case TANDEM_ATTR_STATE:
-		value = st->permanent_fault ? ADI_TANDEM_AGC_STATE_FAULTED :
+		value = (st->permanent_fault || st->software_fault) ?
+			ADI_TANDEM_AGC_STATE_FAULTED :
 			st->acquired ?
 			tandem_read(st, TANDEM_REG_STATUS) & TANDEM_STATUS_STATE_MASK :
 			ADI_TANDEM_AGC_STATE_IDLE;
@@ -531,6 +532,7 @@ static ssize_t tandem_attr_show(struct device *dev,
 		break;
 	case TANDEM_ATTR_FAULTS:
 		value = tandem_read(st, TANDEM_REG_FAULT) |
+			st->software_fault |
 			(st->permanent_fault ? ADI_TANDEM_AGC_FAULT_RESTORE : 0);
 		break;
 	case TANDEM_ATTR_FIFO_DEPTH:
