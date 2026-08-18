@@ -129,6 +129,8 @@ static void tandem_fill_status(struct adi_tandem_agc *st,
 	status->maximum_gain_index = st->gain.maximum_gain_index;
 	status->rx1_gain_index = gain_current;
 	status->rx2_gain_index = gain_current >> 8;
+	status->gain_table_id = st->gain.gain_table_id;
+	status->threshold_provenance = tandem_read(st, TANDEM_REG_THRESHOLDS);
 }
 
 static int tandem_validate_request(struct adi_tandem_agc *st,

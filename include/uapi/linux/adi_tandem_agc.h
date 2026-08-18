@@ -16,6 +16,10 @@
 
 #define ADI_TANDEM_AGC_FAULT_RESTORE		(1U << 31)
 
+#define ADI_TANDEM_AGC_GAIN_TABLE_200_1300_MHZ	1U
+#define ADI_TANDEM_AGC_GAIN_TABLE_1300_4000_MHZ	2U
+#define ADI_TANDEM_AGC_GAIN_TABLE_4000_6000_MHZ	3U
+
 enum adi_tandem_agc_mode {
 	ADI_TANDEM_AGC_MODE_HOLD = 0,
 	ADI_TANDEM_AGC_MODE_AUTO = 1,
@@ -31,8 +35,9 @@ enum adi_tandem_agc_state {
 };
 
 /*
- * The metadata provider passes this complete little-endian request to ACQUIRE.
- * Gain values are integer dB. Detector thresholds are the native unsigned
+ * The metadata provider decodes the little-endian SPF wire request into this
+ * native-endian ioctl request before ACQUIRE. Gain values are integer dB.
+ * Detector thresholds are the native unsigned
  * AD9361 threshold codes and must be reported back in session provenance.
  */
 struct adi_tandem_agc_request_v1 {
@@ -88,7 +93,9 @@ struct adi_tandem_agc_status {
 	__u8 maximum_gain_index;
 	__u8 rx1_gain_index;
 	__u8 rx2_gain_index;
-	__u32 reserved[8];
+	__u32 gain_table_id;
+	__u32 threshold_provenance;
+	__u32 reserved[6];
 };
 
 struct adi_tandem_agc_acquire {

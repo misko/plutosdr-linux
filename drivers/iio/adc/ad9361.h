@@ -137,6 +137,7 @@ struct ad9361_tandem_result {
 	u8 minimum_gain_index;
 	u8 maximum_gain_index;
 	u8 initial_gain_index;
+	u8 gain_table_id;
 };
 
 struct ad9361_tandem_config {

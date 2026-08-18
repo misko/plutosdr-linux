@@ -2351,6 +2351,7 @@ int ad9361_tandem_prepare(struct ad9361_rf_phy *phy, void *owner,
 	result->minimum_gain_index = min_index;
 	result->maximum_gain_index = max_index;
 	result->initial_gain_index = initial_index;
+	result->gain_table_id = ad9361_gt(phy) + 1;
 	goto out_unlock;
 
 out_restore:
