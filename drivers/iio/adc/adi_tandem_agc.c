@@ -367,12 +367,23 @@ static int tandem_acquire_locked(struct adi_tandem_agc *st,
 
 	control = TANDEM_CONTROL_OWN;
 	tandem_write(st, TANDEM_REG_CONTROL, control);
+	/*
+	 * CONTROL is acknowledged in the AXI clock domain before the request has
+	 * necessarily crossed into the receive clock domain.  Do not arm CTRL_IN
+	 * until the FPGA confirms that it owns the pins and is driving HOLD-low.
+	 */
+	ret = tandem_wait_state(st, ADI_TANDEM_AGC_STATE_ARMED_HOLD);
+	if (ret)
+		goto err_disarm;
 	ret = ad9361_tandem_arm(st->phy, st);
 	if (ret)
 		goto err_disarm;
 	if (req->mode == ADI_TANDEM_AGC_MODE_AUTO) {
 		control |= TANDEM_CONTROL_AUTO;
 		tandem_write(st, TANDEM_REG_CONTROL, control);
+		ret = tandem_wait_state(st, ADI_TANDEM_AGC_STATE_ARMED_AUTO);
+		if (ret)
+			goto err_release;
 	}
 
 	if ((tandem_read(st, TANDEM_REG_CONTROL) & control) != control ||
