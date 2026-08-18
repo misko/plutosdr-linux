@@ -20,6 +20,7 @@
 #include <linux/poll.h>
 #include <linux/spi/spi.h>
 #include <linux/uaccess.h>
+#include <linux/workqueue.h>
 
 #include <linux/adi_tandem_agc.h>
 
@@ -49,6 +50,7 @@
 
 #define TANDEM_FPGA_ID			0x54414732U /* "TAG2" */
 #define TANDEM_FPGA_ABI			1U
+#define TANDEM_WATCHDOG_TIMEOUT		(5 * HZ)
 
 #define TANDEM_CONTROL_OWN		BIT(0)
 #define TANDEM_CONTROL_AUTO		BIT(1)
@@ -74,6 +76,8 @@ enum tandem_attr {
 	TANDEM_ATTR_FAULTS,
 	TANDEM_ATTR_FIFO_DEPTH,
 	TANDEM_ATTR_FIFO_LEVEL,
+	TANDEM_ATTR_RX1_GAIN_INDEX,
+	TANDEM_ATTR_RX2_GAIN_INDEX,
 	TANDEM_ATTR_TRANSITIONS,
 	TANDEM_ATTR_OVERFLOWS,
 };
@@ -93,6 +97,7 @@ struct adi_tandem_agc {
 	u32 epoch;
 	u32 fifo_depth;
 	struct ad9361_tandem_result gain;
+	struct delayed_work watchdog_work;
 };
 
 static u32 tandem_read(struct adi_tandem_agc *st, unsigned int reg)
@@ -159,6 +164,13 @@ static void tandem_verify_radio_locked(struct adi_tandem_agc *st)
 		st->software_fault = ADI_TANDEM_AGC_FAULT_RADIO_IO;
 }
 
+static void tandem_heartbeat_locked(struct adi_tandem_agc *st)
+{
+	if (st->acquired)
+		mod_delayed_work(system_wq, &st->watchdog_work,
+				 TANDEM_WATCHDOG_TIMEOUT);
+}
+
 static int tandem_validate_request(struct adi_tandem_agc *st,
 				   const struct adi_tandem_agc_request_v1 *req)
 {
@@ -201,6 +213,7 @@ static int tandem_release_locked(struct adi_tandem_agc *st)
 
 	if (!st->acquired && !st->permanent_fault)
 		return 0;
+	cancel_delayed_work(&st->watchdog_work);
 
 	/* Stop decisions but retain actively-low FPGA pin ownership. */
 	tandem_write(st, TANDEM_REG_CONTROL, TANDEM_CONTROL_OWN);
@@ -213,6 +226,25 @@ static int tandem_release_locked(struct adi_tandem_agc *st)
 	st->acquired = false;
 
 	return ret;
+}
+
+static void tandem_watchdog_work(struct work_struct *work)
+{
+	struct adi_tandem_agc *st = container_of(to_delayed_work(work),
+						 struct adi_tandem_agc,
+						 watchdog_work);
+
+	mutex_lock(&st->lock);
+	if (st->acquired) {
+		/*
+		 * A live provider calls GET_STATUS for every completed frame.  If it
+		 * stops making progress, suppress pulses and restore the AD9361 even
+		 * though its process still owns the descriptor.
+		 */
+		tandem_release_locked(st);
+		st->software_fault = ADI_TANDEM_AGC_FAULT_WATCHDOG;
+	}
+	mutex_unlock(&st->lock);
 }
 
 static int tandem_acquire_locked(struct adi_tandem_agc *st,
@@ -305,6 +337,7 @@ static int tandem_acquire_locked(struct adi_tandem_agc *st,
 	}
 
 	st->acquired = true;
+	tandem_heartbeat_locked(st);
 	tandem_fill_status(st, &acquire->status);
 	return 0;
 
@@ -375,6 +408,7 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 			ret = -EFAULT;
 		break;
 	case ADI_TANDEM_AGC_IOC_GET_STATUS:
+		tandem_heartbeat_locked(st);
 		tandem_verify_radio_locked(st);
 		tandem_fill_status(st, &status);
 		if (copy_to_user(argp, &status, sizeof(status)))
@@ -418,6 +452,7 @@ static ssize_t tandem_events_read(struct file *file, char __user *buf,
 		copied = -ENODATA;
 		goto out;
 	}
+	tandem_heartbeat_locked(st);
 	while (count - copied >= sizeof(event) &&
 	       tandem_read(st, TANDEM_REG_FIFO_LEVEL)) {
 		words[0] = tandem_read(st, TANDEM_REG_EVENT_WORD0);
@@ -504,6 +539,12 @@ static ssize_t tandem_attr_show(struct device *dev,
 	case TANDEM_ATTR_FIFO_LEVEL:
 		value = tandem_read(st, TANDEM_REG_FIFO_LEVEL);
 		break;
+	case TANDEM_ATTR_RX1_GAIN_INDEX:
+		value = tandem_read(st, TANDEM_REG_GAIN_CURRENT) & U8_MAX;
+		break;
+	case TANDEM_ATTR_RX2_GAIN_INDEX:
+		value = tandem_read(st, TANDEM_REG_GAIN_CURRENT) >> 8 & U8_MAX;
+		break;
 	case TANDEM_ATTR_TRANSITIONS:
 		value = tandem_read(st, TANDEM_REG_TRANSITION_COUNT);
 		break;
@@ -531,6 +572,8 @@ static TANDEM_ATTR_RO(ownership_epoch, TANDEM_ATTR_EPOCH);
 static TANDEM_ATTR_RO(fault_flags, TANDEM_ATTR_FAULTS);
 static TANDEM_ATTR_RO(fifo_depth, TANDEM_ATTR_FIFO_DEPTH);
 static TANDEM_ATTR_RO(fifo_level, TANDEM_ATTR_FIFO_LEVEL);
+static TANDEM_ATTR_RO(rx1_gain_index, TANDEM_ATTR_RX1_GAIN_INDEX);
+static TANDEM_ATTR_RO(rx2_gain_index, TANDEM_ATTR_RX2_GAIN_INDEX);
 static TANDEM_ATTR_RO(transition_count, TANDEM_ATTR_TRANSITIONS);
 static TANDEM_ATTR_RO(overflow_count, TANDEM_ATTR_OVERFLOWS);
 
@@ -544,6 +587,8 @@ static struct attribute *tandem_attrs[] = {
 	&iio_dev_attr_fault_flags.dev_attr.attr,
 	&iio_dev_attr_fifo_depth.dev_attr.attr,
 	&iio_dev_attr_fifo_level.dev_attr.attr,
+	&iio_dev_attr_rx1_gain_index.dev_attr.attr,
+	&iio_dev_attr_rx2_gain_index.dev_attr.attr,
 	&iio_dev_attr_transition_count.dev_attr.attr,
 	&iio_dev_attr_overflow_count.dev_attr.attr,
 	NULL,
@@ -581,6 +626,7 @@ static int adi_tandem_agc_probe(struct platform_device *pdev)
 	st = iio_priv(indio_dev);
 	st->dev = &pdev->dev;
 	mutex_init(&st->lock);
+	INIT_DELAYED_WORK(&st->watchdog_work, tandem_watchdog_work);
 
 	st->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(st->regs))
@@ -644,6 +690,7 @@ static void adi_tandem_agc_shutdown(struct platform_device *pdev)
 	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
 	struct adi_tandem_agc *st = iio_priv(indio_dev);
 
+	cancel_delayed_work_sync(&st->watchdog_work);
 	mutex_lock(&st->lock);
 	tandem_release_locked(st);
 	/* Also enforce fail-closed when shutdown occurs without a lease. */
