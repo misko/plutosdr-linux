@@ -392,6 +392,18 @@ config ADI_AXI_ADC
 	  To compile this driver as a module, choose M here: the
 	  module will be called adi-axi-adc.
 
+config ADI_TANDEM_AGC
+	tristate "Analog Devices AD9361 tandem AGC controller"
+	depends on OF && SPI && AD9361
+	help
+	  Safe ownership and event interface for the FPGA controller that steps
+	  both AD9361 receive gains together. The IIO device is read-only; one
+	  exclusive local character-device lease performs the atomic transaction
+	  and restores the radio automatically when its descriptor closes.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called adi_tandem_agc.
+
 config ASPEED_ADC
 	tristate "Aspeed ADC"
 	depends on ARCH_ASPEED || COMPILE_TEST

@@ -2172,6 +2172,245 @@ out:
 	return rc;
 }
 
+/*
+ * Tandem gain ownership is intentionally implemented inside the AD9361
+ * driver.  That keeps gain-table interpretation and the register transaction
+ * behind the driver that owns them, instead of duplicating it in an FPGA
+ * platform driver.  The caller must never hold phy->lock.
+ */
+static const u16 ad9361_tandem_snapshot_regs[] = {
+	REG_AGC_CONFIG_1,
+	REG_AGC_CONFIG_2,
+	REG_AGC_CONFIG_3,
+	REG_PEAK_WAIT_TIME,
+	REG_RX1_MANUAL_LMT_FULL_GAIN,
+	REG_RX1_MANUAL_LPF_GAIN,
+	REG_RX1_MANUAL_DIGITALFORCED_GAIN,
+	REG_RX2_MANUAL_LMT_FULL_GAIN,
+	REG_RX2_MANUAL_LPF_GAIN,
+	REG_RX2_MANUAL_DIGITALFORCED_GAIN,
+	REG_CTRL_OUTPUT_POINTER,
+	REG_CTRL_OUTPUT_ENABLE,
+	REG_FAST_LOW_POWER_THRESH,
+	REG_LARGE_LMT_OVERLOAD_THRESH,
+	REG_ADC_LARGE_OVERLOAD_THRESH,
+	REG_ADC_SMALL_OVERLOAD_THRESH,
+};
+
+static int ad9361_tandem_restore_locked(struct ad9361_rf_phy *phy)
+{
+	int err, ret = 0;
+	unsigned int i;
+
+	/* Relinquish CTRL_IN first, irrespective of the saved register value. */
+	err = ad9361_spi_writef(phy->spi, REG_AGC_CONFIG_2,
+				MAN_GAIN_CTRL_RX1 | MAN_GAIN_CTRL_RX2, 0);
+	if (err)
+		ret = err;
+
+	for (i = 4; i < ARRAY_SIZE(ad9361_tandem_snapshot_regs); i++) {
+		err = ad9361_spi_write(phy->spi,
+				       ad9361_tandem_snapshot_regs[i],
+				       phy->tandem_snapshot[i]);
+		if (err && !ret)
+			ret = err;
+	}
+	err = ad9361_spi_write(phy->spi, REG_AGC_CONFIG_3,
+			       phy->tandem_snapshot[2]);
+	if (err && !ret)
+		ret = err;
+	err = ad9361_spi_write(phy->spi, REG_PEAK_WAIT_TIME,
+			       phy->tandem_snapshot[3]);
+	if (err && !ret)
+		ret = err;
+	err = ad9361_spi_write(phy->spi, REG_AGC_CONFIG_1,
+			       phy->tandem_snapshot[0]);
+	if (err && !ret)
+		ret = err;
+	err = ad9361_spi_write(phy->spi, REG_AGC_CONFIG_2,
+			       phy->tandem_snapshot[1]);
+	if (err && !ret)
+		ret = err;
+
+	return ret;
+}
+
+int ad9361_tandem_prepare(struct ad9361_rf_phy *phy, void *owner,
+			  const struct ad9361_tandem_config *config,
+			  struct ad9361_tandem_result *result)
+{
+	struct gain_table_info *table;
+	int min_index, max_index, initial_index;
+	int state, value, ret = 0;
+	unsigned int i;
+
+	if (!phy || !owner || !config || !result)
+		return -EINVAL;
+	if (config->minimum_gain_db > config->initial_gain_db ||
+	    config->initial_gain_db > config->maximum_gain_db ||
+	    config->low_power_threshold > 0x7f ||
+	    config->large_lmt_overload_threshold > 0x3f)
+		return -EINVAL;
+
+	mutex_lock(&phy->lock);
+	if (phy->tandem_owner) {
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+	if (!phy->pdata->rx2tx2 || phy->pdata->split_gt) {
+		ret = -EOPNOTSUPP;
+		goto out_unlock;
+	}
+
+	state = ad9361_ensm_get_state(phy);
+	if (state != ENSM_STATE_RX && state != ENSM_STATE_FDD) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
+
+	table = &phy->gt_info[ad9361_gt(phy)];
+	min_index = find_table_index(phy, config->minimum_gain_db);
+	max_index = find_table_index(phy, config->maximum_gain_db);
+	initial_index = find_table_index(phy, config->initial_gain_db);
+	if (min_index < 0 || max_index < 0 || initial_index < 0 ||
+	    table->abs_gain_tbl[min_index] != config->minimum_gain_db ||
+	    table->abs_gain_tbl[max_index] != config->maximum_gain_db ||
+	    table->abs_gain_tbl[initial_index] != config->initial_gain_db) {
+		ret = -ERANGE;
+		goto out_unlock;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(ad9361_tandem_snapshot_regs); i++) {
+		value = ad9361_spi_read(phy->spi,
+					ad9361_tandem_snapshot_regs[i]);
+		if (value < 0) {
+			ret = value;
+			goto out_unlock;
+		}
+		phy->tandem_snapshot[i] = value;
+	}
+
+	/* An already armed external pin controller cannot be restored safely. */
+	if (phy->tandem_snapshot[1] &
+	    (MAN_GAIN_CTRL_RX1 | MAN_GAIN_CTRL_RX2)) {
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+	if (phy->tandem_snapshot[1] & DIG_GAIN_EN) {
+		ret = -EOPNOTSUPP;
+		goto out_unlock;
+	}
+
+	phy->tandem_owner = owner;
+	ret = ad9361_spi_writef(phy->spi, REG_AGC_CONFIG_2,
+				MAN_GAIN_CTRL_RX1 | MAN_GAIN_CTRL_RX2, 0);
+	ret |= ad9361_spi_writef(phy->spi, REG_AGC_CONFIG_1,
+				 RX_GAIN_CTL_MASK << RX1_GAIN_CTRL_SHIFT |
+				 RX_GAIN_CTL_MASK << RX2_GAIN_CTRL_SHIFT, 0);
+	ret |= ad9361_spi_writef(phy->spi, REG_AGC_CONFIG_3,
+				 MANUAL_INCR_STEP_SIZE(~0),
+				 MANUAL_INCR_STEP_SIZE(0));
+	ret |= ad9361_spi_writef(phy->spi, REG_PEAK_WAIT_TIME,
+				 MANUAL_CTRL_IN_DECR_GAIN_STP_SIZE(~0),
+				 MANUAL_CTRL_IN_DECR_GAIN_STP_SIZE(0));
+	ret |= ad9361_spi_writef(phy->spi, REG_RX1_MANUAL_LMT_FULL_GAIN,
+				 RX_FULL_TBL_IDX_MASK, initial_index);
+	ret |= ad9361_spi_writef(phy->spi, REG_RX2_MANUAL_LMT_FULL_GAIN,
+				 RX_FULL_TBL_IDX_MASK, initial_index);
+	ret |= ad9361_spi_write(phy->spi, REG_CTRL_OUTPUT_POINTER, 0x03);
+	ret |= ad9361_spi_write(phy->spi, REG_CTRL_OUTPUT_ENABLE, 0xff);
+	ret |= ad9361_spi_writef(phy->spi, REG_FAST_LOW_POWER_THRESH,
+				 LOW_POWER_THRESH(~0),
+				 config->low_power_threshold);
+	ret |= ad9361_spi_writef(phy->spi, REG_LARGE_LMT_OVERLOAD_THRESH,
+				 LARGE_LMT_OVERLOAD_THRESH(~0),
+				 config->large_lmt_overload_threshold);
+	ret |= ad9361_spi_write(phy->spi, REG_ADC_LARGE_OVERLOAD_THRESH,
+				 config->large_adc_overload_threshold);
+	ret |= ad9361_spi_write(phy->spi, REG_ADC_SMALL_OVERLOAD_THRESH,
+				 config->small_adc_overload_threshold);
+	if (ret)
+		goto out_restore;
+
+	value = ad9361_spi_readf(phy->spi, REG_RX1_MANUAL_LMT_FULL_GAIN,
+				 RX_FULL_TBL_IDX_MASK);
+	if (value != initial_index) {
+		ret = -EIO;
+		goto out_restore;
+	}
+	value = ad9361_spi_readf(phy->spi, REG_RX2_MANUAL_LMT_FULL_GAIN,
+				 RX_FULL_TBL_IDX_MASK);
+	if (value != initial_index) {
+		ret = -EIO;
+		goto out_restore;
+	}
+
+	result->minimum_gain_db = config->minimum_gain_db;
+	result->maximum_gain_db = config->maximum_gain_db;
+	result->initial_gain_db = config->initial_gain_db;
+	result->minimum_gain_index = min_index;
+	result->maximum_gain_index = max_index;
+	result->initial_gain_index = initial_index;
+	goto out_unlock;
+
+out_restore:
+	value = ad9361_tandem_restore_locked(phy);
+	if (value)
+		ret = value;
+	else
+		phy->tandem_owner = NULL;
+out_unlock:
+	mutex_unlock(&phy->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ad9361_tandem_prepare);
+
+int ad9361_tandem_arm(struct ad9361_rf_phy *phy, void *owner)
+{
+	int ret, value;
+
+	if (!phy || !owner)
+		return -EINVAL;
+
+	mutex_lock(&phy->lock);
+	if (phy->tandem_owner != owner) {
+		ret = -EPERM;
+		goto out;
+	}
+	ret = ad9361_spi_writef(phy->spi, REG_AGC_CONFIG_2,
+				MAN_GAIN_CTRL_RX1 | MAN_GAIN_CTRL_RX2,
+				MAN_GAIN_CTRL_RX1 | MAN_GAIN_CTRL_RX2);
+	value = ad9361_spi_readf(phy->spi, REG_AGC_CONFIG_2,
+				 MAN_GAIN_CTRL_RX1 | MAN_GAIN_CTRL_RX2);
+	if (!ret && value != (MAN_GAIN_CTRL_RX1 | MAN_GAIN_CTRL_RX2))
+		ret = -EIO;
+out:
+	mutex_unlock(&phy->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ad9361_tandem_arm);
+
+int ad9361_tandem_release(struct ad9361_rf_phy *phy, void *owner)
+{
+	int ret = 0;
+
+	if (!phy || !owner)
+		return -EINVAL;
+
+	mutex_lock(&phy->lock);
+	if (phy->tandem_owner != owner) {
+		ret = -EPERM;
+		goto out;
+	}
+	ret = ad9361_tandem_restore_locked(phy);
+	if (!ret)
+		phy->tandem_owner = NULL;
+out:
+	mutex_unlock(&phy->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ad9361_tandem_release);
+
 static int ad9361_read_rssi(struct ad9361_rf_phy *phy, struct rf_rssi *rssi)
 {
 	struct spi_device *spi = phy->spi;
@@ -6815,6 +7054,10 @@ static ssize_t ad9361_phy_store(struct device *dev,
 		return -EINVAL;
 
 	mutex_lock(&phy->lock);
+	if (phy->tandem_owner) {
+		ret = -EBUSY;
+		goto out;
+	}
 
 	switch ((u32)this_attr->address) {
 	case AD9361_RF_RX_BANDWIDTH:
@@ -7075,6 +7318,7 @@ static ssize_t ad9361_phy_store(struct device *dev,
 		ret = -EINVAL;
 	}
 
+out:
 	mutex_unlock(&phy->lock);
 
 	return ret ? ret : len;
@@ -7383,7 +7627,8 @@ static int ad9361_phy_reg_access(struct iio_dev *indio_dev,
 
 	mutex_lock(&phy->lock);
 	if (readval == NULL) {
-		ret = ad9361_spi_write(phy->spi, reg, writeval);
+		ret = phy->tandem_owner ? -EBUSY :
+			ad9361_spi_write(phy->spi, reg, writeval);
 	} else {
 		*readval =  ad9361_spi_read(phy->spi, reg);
 		ret = 0;
@@ -7442,6 +7687,10 @@ static ssize_t ad9361_phy_lo_write(struct iio_dev *indio_dev,
 	}
 
 	mutex_lock(&phy->lock);
+	if (phy->tandem_owner) {
+		ret = -EBUSY;
+		goto out;
+	}
 	switch (private) {
 	case LOEXT_FREQ:
 		switch (chan->channel) {
@@ -7537,6 +7786,7 @@ static ssize_t ad9361_phy_lo_write(struct iio_dev *indio_dev,
 
 		break;
 	}
+out:
 	mutex_unlock(&phy->lock);
 
 	return ret ? ret : len;
@@ -7658,13 +7908,23 @@ static int ad9361_set_agc_mode(struct iio_dev *indio_dev,
 	struct ad9361_rf_phy_state *st = phy->state;
 	struct rf_gain_ctrl gc = {0};
 
-	if (st->agc_mode[chan->channel] == mode)
+	mutex_lock(&phy->lock);
+	if (phy->tandem_owner) {
+		mutex_unlock(&phy->lock);
+		return -EBUSY;
+	}
+	if (st->agc_mode[chan->channel] == mode) {
+		mutex_unlock(&phy->lock);
 		return 0;
+	}
 
 	gc.ant = ad9361_1rx1tx_channel_map(phy, false, chan->channel + 1);
 	gc.mode = st->agc_mode[chan->channel] = mode;
 
-	return ad9361_set_gain_ctrl_mode(phy, &gc);
+	mode = ad9361_set_gain_ctrl_mode(phy, &gc);
+	mutex_unlock(&phy->lock);
+
+	return mode;
 }
 
 static int ad9361_get_agc_mode(struct iio_dev *indio_dev,
@@ -7969,6 +8229,10 @@ static int ad9361_phy_write_raw(struct iio_dev *indio_dev,
 		return -EINVAL;
 
 	mutex_lock(&phy->lock);
+	if (phy->tandem_owner) {
+		ret = -EBUSY;
+		goto out;
+	}
 	switch (mask) {
 	case IIO_CHAN_INFO_HARDWAREGAIN:
 		if (chan->output) {
@@ -8279,6 +8543,10 @@ static ssize_t ad9361_debugfs_write(struct file *file,
 		if (!(ret == 1 && val == 1))
 			return -EINVAL;
 		mutex_lock(&phy->lock);
+		if (phy->tandem_owner) {
+			mutex_unlock(&phy->lock);
+			return -EBUSY;
+		}
 		clk_set_rate(phy->clks[TX_SAMPL_CLK], 1);
 		clk_set_parent(phy->clks[RX_RFPLL], phy->clk_ext_lo_rx);
 		clk_set_parent(phy->clks[TX_RFPLL], phy->clk_ext_lo_tx);
@@ -8296,6 +8564,10 @@ static ssize_t ad9361_debugfs_write(struct file *file,
 		if (ret != 1)
 			return -EINVAL;
 		mutex_lock(&phy->lock);
+		if (phy->tandem_owner) {
+			mutex_unlock(&phy->lock);
+			return -EBUSY;
+		}
 		ret = ad9361_bist_loopback(phy, val);
 		mutex_unlock(&phy->lock);
 		if (ret < 0)
@@ -8307,6 +8579,10 @@ static ssize_t ad9361_debugfs_write(struct file *file,
 		if (ret != 1)
 			return -EINVAL;
 		mutex_lock(&phy->lock);
+		if (phy->tandem_owner) {
+			mutex_unlock(&phy->lock);
+			return -EBUSY;
+		}
 		ret = ad9361_bist_prbs(phy, val);
 		mutex_unlock(&phy->lock);
 		if (ret < 0)
@@ -8318,6 +8594,10 @@ static ssize_t ad9361_debugfs_write(struct file *file,
 		if (ret != 4)
 			return -EINVAL;
 		mutex_lock(&phy->lock);
+		if (phy->tandem_owner) {
+			mutex_unlock(&phy->lock);
+			return -EBUSY;
+		}
 		ret = ad9361_bist_tone(phy, val, val2, val3, val4);
 		mutex_unlock(&phy->lock);
 		if (ret < 0)
@@ -8329,6 +8609,10 @@ static ssize_t ad9361_debugfs_write(struct file *file,
 		if (ret != 1)
 			return -EINVAL;
 		mutex_lock(&phy->lock);
+		if (phy->tandem_owner) {
+			mutex_unlock(&phy->lock);
+			return -EBUSY;
+		}
 		ret = ad9361_mcs(phy, val);
 		mutex_unlock(&phy->lock);
 		if (ret < 0)
@@ -8343,6 +8627,10 @@ static ssize_t ad9361_debugfs_write(struct file *file,
 		if (phy->pdata->cal_sw1_gpio &&
 			phy->pdata->cal_sw2_gpio) {
 			mutex_lock(&phy->lock);
+			if (phy->tandem_owner) {
+				mutex_unlock(&phy->lock);
+				return -EBUSY;
+			}
 			gpiod_set_value(phy->pdata->cal_sw1_gpio, !!(val & BIT(0)));
 			gpiod_set_value(phy->pdata->cal_sw2_gpio, !!(val & BIT(1)));
 			mutex_unlock(&phy->lock);
@@ -8356,6 +8644,10 @@ static ssize_t ad9361_debugfs_write(struct file *file,
 		if (ret != 2)
 			return -EINVAL;
 		mutex_lock(&phy->lock);
+		if (phy->tandem_owner) {
+			mutex_unlock(&phy->lock);
+			return -EBUSY;
+		}
 		ret = ad9361_dig_tune(phy, val, val2);
 		mutex_unlock(&phy->lock);
 		if (ret < 0)
@@ -8364,7 +8656,13 @@ static ssize_t ad9361_debugfs_write(struct file *file,
 		entry->val = val;
 		return count;
 	case DBGFS_BIST_DT_ANALYSIS:
+		mutex_lock(&phy->lock);
+		if (phy->tandem_owner) {
+			mutex_unlock(&phy->lock);
+			return -EBUSY;
+		}
 		entry->val = val;
+		mutex_unlock(&phy->lock);
 		return count;
 	case DBGFS_GPO_SET:
 		if (ret != 2)
@@ -8395,6 +8693,10 @@ static ssize_t ad9361_debugfs_write(struct file *file,
 		}
 
 		mutex_lock(&phy->lock);
+		if (phy->tandem_owner) {
+			mutex_unlock(&phy->lock);
+			return -EBUSY;
+		}
 		ctrl->gpo_manual_mode_enable_mask &= ~mask;
 		ctrl->gpo_manual_mode_enable_mask |= val3;
 
@@ -8426,6 +8728,11 @@ static ssize_t ad9361_debugfs_write(struct file *file,
 
 
 	if (entry->out_value) {
+		mutex_lock(&phy->lock);
+		if (phy->tandem_owner) {
+			mutex_unlock(&phy->lock);
+			return -EBUSY;
+		}
 		switch (entry->size){
 		case 1:
 			*(u8*)entry->out_value = val;
@@ -8442,6 +8749,7 @@ static ssize_t ad9361_debugfs_write(struct file *file,
 		default:
 			ret = -EINVAL;
 		}
+		mutex_unlock(&phy->lock);
 	}
 
 	return count;
@@ -9152,8 +9460,16 @@ ad9361_fir_bin_write(struct file *filp, struct kobject *kobj,
 
 	struct iio_dev *indio_dev = dev_to_iio_dev(kobj_to_dev(kobj));
 	struct ad9361_rf_phy *phy = iio_priv(indio_dev);
+	ssize_t ret;
 
-	return ad9361_parse_fir(phy, buf, count);
+	mutex_lock(&phy->lock);
+	if (phy->tandem_owner)
+		ret = -EBUSY;
+	else
+		ret = ad9361_parse_fir(phy, buf, count);
+	mutex_unlock(&phy->lock);
+
+	return ret;
 }
 
 static ssize_t
@@ -9404,6 +9720,11 @@ ad9361_gt_bin_write(struct file *filp, struct kobject *kobj,
 		return PTR_ERR(table);
 
 	mutex_lock(&phy->lock);
+	if (phy->tandem_owner) {
+		mutex_unlock(&phy->lock);
+		ad9361_free_gt(phy, table);
+		return -EBUSY;
+	}
 	ad9361_free_gt(phy, phy->gt_info);
 
 	st->current_table = -1;
@@ -9669,6 +9990,8 @@ MODULE_DEVICE_TABLE(spi, ad9361_id);
 static struct spi_driver ad9361_driver = {
 	.driver = {
 		.name	= "ad9361",
+		/* Tandem ownership cannot survive manual supplier unbind safely. */
+		.suppress_bind_attrs = true,
 	},
 	.probe		= ad9361_probe,
 	.id_table	= ad9361_id,

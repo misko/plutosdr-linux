@@ -127,6 +127,12 @@
 
 		};
 
+		tandem_agc: tandem-agc@7c450000 {
+			compatible = "adi,tandem-agc-2.00.a";
+			reg = <0x7c450000 0x1000>;
+			spibus-connected = <&adc0_ad9364>;
+		};
+
 		rx_dma: dma@7c400000 {
 			compatible = "adi,axi-dmac-1.00.a";
 			reg = <0x7c400000 0x1000>;

@@ -130,6 +130,25 @@ struct refclk_scale {
 struct ad9361_rf_phy_state;
 struct ad9361_ext_band_ctl;
 
+struct ad9361_tandem_result {
+	s32 minimum_gain_db;
+	s32 maximum_gain_db;
+	s32 initial_gain_db;
+	u8 minimum_gain_index;
+	u8 maximum_gain_index;
+	u8 initial_gain_index;
+};
+
+struct ad9361_tandem_config {
+	s32 minimum_gain_db;
+	s32 maximum_gain_db;
+	s32 initial_gain_db;
+	u8 low_power_threshold;
+	u8 large_lmt_overload_threshold;
+	u8 large_adc_overload_threshold;
+	u8 small_adc_overload_threshold;
+};
+
 struct ad9361_rf_phy {
 	struct spi_device 	*spi;
 	struct clk 		*clk_refin;
@@ -152,6 +171,9 @@ struct ad9361_rf_phy {
 	struct mutex		lock;
 	char			*bin_attr_buf;
 	u32 			ad9361_debugfs_entry_index;
+	/* Protected by lock. Only the tandem session API may set this owner. */
+	void			*tandem_owner;
+	u8			tandem_snapshot[16];
 
 	struct ad9361_ext_band_ctl	*ext_band_ctl;
 	struct ad9361_rf_phy_state	*state;
@@ -188,6 +210,11 @@ int ad9361_read_clock_data_delays(struct ad9361_rf_phy *phy);
 int ad9361_write_clock_data_delays(struct ad9361_rf_phy *phy);
 bool ad9361_uses_lvds_mode(struct ad9361_rf_phy *phy);
 int ad9361_set_rx_port(struct ad9361_rf_phy *phy, enum rx_port_sel sel);
+int ad9361_tandem_prepare(struct ad9361_rf_phy *phy, void *owner,
+			  const struct ad9361_tandem_config *config,
+			  struct ad9361_tandem_result *result);
+int ad9361_tandem_arm(struct ad9361_rf_phy *phy, void *owner);
+int ad9361_tandem_release(struct ad9361_rf_phy *phy, void *owner);
 int ad9361_set_tx_port(struct ad9361_rf_phy *phy, enum tx_port_sel sel);
 bool ad9361_bb_clk_change_dig_tune_en(struct ad9361_rf_phy *phy);
 u32 ad9361_get_dig_interface_tune_skipmode(struct ad9361_rf_phy *phy);
@@ -220,4 +247,3 @@ static inline void ad9361_unregister_ext_band_control(
 #endif
 
 #endif
-
