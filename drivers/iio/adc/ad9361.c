@@ -2240,7 +2240,7 @@ int ad9361_tandem_prepare(struct ad9361_rf_phy *phy, void *owner,
 			  struct ad9361_tandem_result *result)
 {
 	struct gain_table_info *table;
-	int min_index, max_index, initial_index;
+	int min_index, max_index, initial_index, clear_index;
 	int state, value, ret = 0;
 	unsigned int i;
 
@@ -2279,6 +2279,8 @@ int ad9361_tandem_prepare(struct ad9361_rf_phy *phy, void *owner,
 		ret = -ERANGE;
 		goto out_unlock;
 	}
+	clear_index = initial_index < table->max_index - 1 ?
+		initial_index + 1 : initial_index - 1;
 
 	for (i = 0; i < ARRAY_SIZE(ad9361_tandem_snapshot_regs); i++) {
 		value = ad9361_spi_read(phy->spi,
@@ -2313,6 +2315,20 @@ int ad9361_tandem_prepare(struct ad9361_rf_phy *phy, void *owner,
 	ret |= ad9361_spi_writef(phy->spi, REG_PEAK_WAIT_TIME,
 				 MANUAL_CTRL_IN_DECR_GAIN_STP_SIZE(~0),
 				 MANUAL_CTRL_IN_DECR_GAIN_STP_SIZE(0));
+	/*
+	 * The overload outputs on CTRL_OUT page 0x03 are latched until a gain
+	 * change.  A previous strong signal can therefore leave small-overload
+	 * asserted while both low-power bits are also asserted.  The tandem policy
+	 * correctly inhibits an increase in that combination, but without a first
+	 * gain edge it can never clear the stale overload and is deadlocked.  Force
+	 * one adjacent manual index before seeding the requested index, while pin
+	 * control is still disabled, so every acquisition starts from fresh
+	 * detector latches.
+	 */
+	ret |= ad9361_spi_writef(phy->spi, REG_RX1_MANUAL_LMT_FULL_GAIN,
+				 RX_FULL_TBL_IDX_MASK, clear_index);
+	ret |= ad9361_spi_writef(phy->spi, REG_RX2_MANUAL_LMT_FULL_GAIN,
+				 RX_FULL_TBL_IDX_MASK, clear_index);
 	ret |= ad9361_spi_writef(phy->spi, REG_RX1_MANUAL_LMT_FULL_GAIN,
 				 RX_FULL_TBL_IDX_MASK, initial_index);
 	ret |= ad9361_spi_writef(phy->spi, REG_RX2_MANUAL_LMT_FULL_GAIN,
