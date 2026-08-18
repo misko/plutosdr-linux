@@ -111,6 +111,20 @@ static void tandem_write(struct adi_tandem_agc *st, unsigned int reg, u32 val)
 	iowrite32(val, st->regs + reg);
 }
 
+static int tandem_wait_state(struct adi_tandem_agc *st, u32 wanted)
+{
+	u32 status;
+	int ret;
+
+	ret = readl_poll_timeout(st->regs + TANDEM_REG_STATUS, status,
+				 (status & TANDEM_STATUS_FAULT) ||
+				 (status & TANDEM_STATUS_STATE_MASK) == wanted,
+				 1, 10000);
+	if (ret)
+		return ret;
+	return status & TANDEM_STATUS_FAULT ? -EIO : 0;
+}
+
 static void tandem_fill_status(struct adi_tandem_agc *st,
 			       struct adi_tandem_agc_status *status)
 {
@@ -144,17 +158,43 @@ static void tandem_fill_status(struct adi_tandem_agc *st,
 
 static void tandem_verify_radio_locked(struct adi_tandem_agc *st)
 {
+	u32 control;
 	u32 gain_current;
+	bool resume_auto;
 	int ret;
 
 	if (!st->acquired || st->software_fault)
 		return;
+
+	/*
+	 * GAIN_CURRENT and the two AD9361 SPI reads are not one atomic bus
+	 * transaction.  Quiesce AUTO while ownership remains asserted so a paired
+	 * gain pulse cannot land inside the verification window and manufacture a
+	 * false index mismatch.  HOLD waits for any pulse already in flight.
+	 */
+	control = tandem_read(st, TANDEM_REG_CONTROL);
+	resume_auto = control & TANDEM_CONTROL_AUTO;
+	if (resume_auto) {
+		tandem_write(st, TANDEM_REG_CONTROL, TANDEM_CONTROL_OWN);
+		ret = tandem_wait_state(st, ADI_TANDEM_AGC_STATE_ARMED_HOLD);
+		if (ret)
+			goto err_suppress;
+	}
 	gain_current = tandem_read(st, TANDEM_REG_GAIN_CURRENT);
 	ret = ad9361_tandem_verify(st->phy, st, gain_current,
 				   gain_current >> 8);
-	if (!ret)
-		return;
+	if (ret)
+		goto err_suppress;
+	if (resume_auto) {
+		tandem_write(st, TANDEM_REG_CONTROL,
+			     TANDEM_CONTROL_OWN | TANDEM_CONTROL_AUTO);
+		ret = tandem_wait_state(st, ADI_TANDEM_AGC_STATE_ARMED_AUTO);
+		if (ret)
+			goto err_suppress;
+	}
+	return;
 
+err_suppress:
 	/* Retain actively-low ownership, but suppress every further pulse. */
 	tandem_write(st, TANDEM_REG_CONTROL, TANDEM_CONTROL_OWN);
 	if (ret == -EUCLEAN)
