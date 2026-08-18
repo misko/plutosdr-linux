@@ -215,6 +215,8 @@ int ad9361_tandem_prepare(struct ad9361_rf_phy *phy, void *owner,
 			  const struct ad9361_tandem_config *config,
 			  struct ad9361_tandem_result *result);
 int ad9361_tandem_arm(struct ad9361_rf_phy *phy, void *owner);
+int ad9361_tandem_verify(struct ad9361_rf_phy *phy, void *owner,
+			 u8 expected_rx1, u8 expected_rx2);
 int ad9361_tandem_release(struct ad9361_rf_phy *phy, void *owner);
 int ad9361_set_tx_port(struct ad9361_rf_phy *phy, enum tx_port_sel sel);
 bool ad9361_bb_clk_change_dig_tune_en(struct ad9361_rf_phy *phy);

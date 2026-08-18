@@ -2391,6 +2391,39 @@ out:
 }
 EXPORT_SYMBOL_GPL(ad9361_tandem_arm);
 
+int ad9361_tandem_verify(struct ad9361_rf_phy *phy, void *owner,
+			 u8 expected_rx1, u8 expected_rx2)
+{
+	int rx1, rx2, state, ret = 0;
+
+	if (!phy || !owner)
+		return -EINVAL;
+	mutex_lock(&phy->lock);
+	if (phy->tandem_owner != owner) {
+		ret = -EPERM;
+		goto out;
+	}
+	state = ad9361_ensm_get_state(phy);
+	if (state != ENSM_STATE_RX && state != ENSM_STATE_FDD) {
+		ret = -EHOSTDOWN;
+		goto out;
+	}
+	rx1 = ad9361_spi_readf(phy->spi, REG_RX1_MANUAL_LMT_FULL_GAIN,
+			       RX_FULL_TBL_IDX_MASK);
+	rx2 = ad9361_spi_readf(phy->spi, REG_RX2_MANUAL_LMT_FULL_GAIN,
+			       RX_FULL_TBL_IDX_MASK);
+	if (rx1 < 0)
+		ret = rx1;
+	else if (rx2 < 0)
+		ret = rx2;
+	else if (rx1 != expected_rx1 || rx2 != expected_rx2)
+		ret = -EUCLEAN;
+out:
+	mutex_unlock(&phy->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ad9361_tandem_verify);
+
 int ad9361_tandem_release(struct ad9361_rf_phy *phy, void *owner)
 {
 	int ret = 0;

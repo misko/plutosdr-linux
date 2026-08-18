@@ -89,6 +89,7 @@ struct adi_tandem_agc {
 	bool session_open;
 	bool acquired;
 	bool permanent_fault;
+	u32 software_fault;
 	u32 epoch;
 	u32 fifo_depth;
 	struct ad9361_tandem_result gain;
@@ -112,12 +113,14 @@ static void tandem_fill_status(struct adi_tandem_agc *st,
 	memset(status, 0, sizeof(*status));
 	status->version = ADI_TANDEM_AGC_ABI_VERSION;
 	status->size = sizeof(*status);
-	status->state = st->permanent_fault ? ADI_TANDEM_AGC_STATE_FAULTED :
+	status->state = (st->permanent_fault || st->software_fault) ?
+		ADI_TANDEM_AGC_STATE_FAULTED :
 		st->acquired ?
 		(tandem_read(st, TANDEM_REG_STATUS) & TANDEM_STATUS_STATE_MASK) :
 		ADI_TANDEM_AGC_STATE_IDLE;
 	status->ownership_epoch = st->acquired ? st->epoch : 0;
 	status->fault_flags = tandem_read(st, TANDEM_REG_FAULT) |
+		st->software_fault |
 		(st->permanent_fault ? ADI_TANDEM_AGC_FAULT_RESTORE : 0);
 	status->fifo_level = tandem_read(st, TANDEM_REG_FIFO_LEVEL);
 	status->overflow_count = tandem_read(st, TANDEM_REG_OVERFLOW_COUNT);
@@ -131,6 +134,29 @@ static void tandem_fill_status(struct adi_tandem_agc *st,
 	status->rx2_gain_index = gain_current >> 8;
 	status->gain_table_id = st->gain.gain_table_id;
 	status->threshold_provenance = tandem_read(st, TANDEM_REG_THRESHOLDS);
+}
+
+static void tandem_verify_radio_locked(struct adi_tandem_agc *st)
+{
+	u32 gain_current;
+	int ret;
+
+	if (!st->acquired || st->software_fault)
+		return;
+	gain_current = tandem_read(st, TANDEM_REG_GAIN_CURRENT);
+	ret = ad9361_tandem_verify(st->phy, st, gain_current,
+				   gain_current >> 8);
+	if (!ret)
+		return;
+
+	/* Retain actively-low ownership, but suppress every further pulse. */
+	tandem_write(st, TANDEM_REG_CONTROL, TANDEM_CONTROL_OWN);
+	if (ret == -EUCLEAN)
+		st->software_fault = ADI_TANDEM_AGC_FAULT_INDEX_MISMATCH;
+	else if (ret == -EHOSTDOWN)
+		st->software_fault = ADI_TANDEM_AGC_FAULT_RADIO_STATE;
+	else
+		st->software_fault = ADI_TANDEM_AGC_FAULT_RADIO_IO;
 }
 
 static int tandem_validate_request(struct adi_tandem_agc *st,
@@ -212,6 +238,7 @@ static int tandem_acquire_locked(struct adi_tandem_agc *st,
 		return -EBUSY;
 	if (st->permanent_fault)
 		return -EIO;
+	st->software_fault = 0;
 	ret = tandem_validate_request(st, req);
 	if (ret)
 		return ret;
@@ -348,6 +375,7 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 			ret = -EFAULT;
 		break;
 	case ADI_TANDEM_AGC_IOC_GET_STATUS:
+		tandem_verify_radio_locked(st);
 		tandem_fill_status(st, &status);
 		if (copy_to_user(argp, &status, sizeof(status)))
 			ret = -EFAULT;
@@ -623,6 +651,12 @@ static void adi_tandem_agc_shutdown(struct platform_device *pdev)
 	mutex_unlock(&st->lock);
 }
 
+static int adi_tandem_agc_remove(struct platform_device *pdev)
+{
+	adi_tandem_agc_shutdown(pdev);
+	return 0;
+}
+
 static struct platform_driver adi_tandem_agc_driver = {
 	.driver = {
 		.name = "adi-tandem-agc",
@@ -630,6 +664,7 @@ static struct platform_driver adi_tandem_agc_driver = {
 		.suppress_bind_attrs = true,
 	},
 	.probe = adi_tandem_agc_probe,
+	.remove = adi_tandem_agc_remove,
 	.shutdown = adi_tandem_agc_shutdown,
 };
 module_platform_driver(adi_tandem_agc_driver);
