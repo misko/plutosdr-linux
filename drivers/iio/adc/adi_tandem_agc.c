@@ -8,6 +8,7 @@
  */
 #include <linux/fs.h>
 #include <linux/clk-provider.h>
+#include <linux/delay.h>
 #include <linux/iio/iio.h>
 #include <linux/iio/sysfs.h>
 #include <linux/io.h>
@@ -173,9 +174,12 @@ static int tandem_release_locked(struct adi_tandem_agc *st)
 	if (!st->acquired && !st->permanent_fault)
 		return 0;
 
-	/* Suppress FPGA pulses before making CTRL_IN writes meaningful again. */
-	tandem_write(st, TANDEM_REG_CONTROL, 0);
+	/* Stop decisions but retain actively-low FPGA pin ownership. */
+	tandem_write(st, TANDEM_REG_CONTROL, TANDEM_CONTROL_OWN);
+	usleep_range(50, 100);
 	ret = ad9361_tandem_release(st->phy, st);
+	/* Pin control is disarmed; only now may the mux return to PS/high-Z. */
+	tandem_write(st, TANDEM_REG_CONTROL, 0);
 	if (ret && ret != -EPERM)
 		st->permanent_fault = true;
 	st->acquired = false;
@@ -277,10 +281,12 @@ static int tandem_acquire_locked(struct adi_tandem_agc *st,
 
 err_release:
 err_disarm:
-	tandem_write(st, TANDEM_REG_CONTROL, 0);
+	tandem_write(st, TANDEM_REG_CONTROL, TANDEM_CONTROL_OWN);
+	usleep_range(50, 100);
 err_restore:
 	if (ad9361_tandem_release(st->phy, st))
 		st->permanent_fault = true;
+	tandem_write(st, TANDEM_REG_CONTROL, 0);
 	return ret;
 }
 
