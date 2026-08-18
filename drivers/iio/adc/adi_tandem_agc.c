@@ -12,6 +12,7 @@
 #include <linux/iio/iio.h>
 #include <linux/iio/sysfs.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -309,6 +310,10 @@ static int tandem_acquire_locked(struct adi_tandem_agc *st,
 		     req->large_adc_overload_threshold << 16 |
 		     req->small_adc_overload_threshold << 24);
 	tandem_write(st, TANDEM_REG_CONTROL, TANDEM_CONTROL_CLEAR);
+	ret = readl_poll_timeout(st->regs + TANDEM_REG_FAULT, control,
+				 !(control), 1, 10000);
+	if (ret)
+		goto err_restore;
 	tandem_write(st, TANDEM_REG_CONTROL, 0);
 
 	if (tandem_read(st, TANDEM_REG_EPOCH) != st->epoch ||
