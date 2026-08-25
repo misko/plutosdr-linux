@@ -52,6 +52,7 @@
 #define TANDEM_FPGA_ID			0x54414732U /* "TAG2" */
 #define TANDEM_FPGA_ABI			1U
 #define TANDEM_WATCHDOG_TIMEOUT		(5 * HZ)
+#define TANDEM_FIFO_POP_TIMEOUT_US	10000
 
 #define TANDEM_CONTROL_OWN		BIT(0)
 #define TANDEM_CONTROL_AUTO		BIT(1)
@@ -123,6 +124,65 @@ static int tandem_wait_state(struct adi_tandem_agc *st, u32 wanted)
 	if (ret)
 		return ret;
 	return status & TANDEM_STATUS_FAULT ? -EIO : 0;
+}
+
+static int tandem_wait_quiescent(struct adi_tandem_agc *st, bool allow_idle)
+{
+	u32 status;
+
+	/*
+	 * Normal AUTO suppression lands in ARMED_HOLD only after any pulse in
+	 * flight has finished.  A hardware fault instead passes through DISARMING,
+	 * which waits for !pulse_busy, and only then lands in FAULTED.  IDLE is
+	 * accepted solely while retrying a previously failed restore; an acquired
+	 * session reporting IDLE is not a valid quiescence acknowledgment.  Do not
+	 * accept RESTORING: that public state includes internal DISARMING while a
+	 * pulse may still be active.
+	 */
+	return readl_poll_timeout(st->regs + TANDEM_REG_STATUS, status,
+				  (status & TANDEM_STATUS_STATE_MASK) ==
+					ADI_TANDEM_AGC_STATE_ARMED_HOLD ||
+				  (status & TANDEM_STATUS_STATE_MASK) ==
+					ADI_TANDEM_AGC_STATE_FAULTED ||
+				  (allow_idle &&
+				   (status & TANDEM_STATUS_STATE_MASK) ==
+					ADI_TANDEM_AGC_STATE_IDLE),
+				  1, 10000);
+}
+
+static int tandem_retire_events_locked(struct adi_tandem_agc *st)
+{
+	u32 level, previous;
+	unsigned int retired = 0;
+	int ret;
+
+	/*
+	 * AUTO is quiescent before entry, so FIFO occupancy can only decrease.
+	 * Pop complete records through the public event ABI rather than CLEAR:
+	 * transition, overflow, and fault diagnostics must survive release.
+	 */
+	/* Let the final quiescent write pointer cross before accepting empty. */
+	usleep_range(50, 100);
+	for (;;) {
+		previous = tandem_read(st, TANDEM_REG_FIFO_LEVEL);
+		if (!previous)
+			return 0;
+		if (previous > st->fifo_depth || retired >= st->fifo_depth)
+			return -EIO;
+
+		(void)tandem_read(st, TANDEM_REG_EVENT_WORD0);
+		(void)tandem_read(st, TANDEM_REG_EVENT_WORD1);
+		(void)tandem_read(st, TANDEM_REG_EVENT_WORD2);
+		(void)tandem_read(st, TANDEM_REG_EVENT_WORD3_POP);
+		retired++;
+
+		/* FIFO level crosses from the receive domain through gray pointers. */
+		ret = readl_poll_timeout(st->regs + TANDEM_REG_FIFO_LEVEL, level,
+					 level < previous, 1,
+					 TANDEM_FIFO_POP_TIMEOUT_US);
+		if (ret)
+			return ret;
+	}
 }
 
 static void tandem_fill_status(struct adi_tandem_agc *st,
@@ -250,7 +310,7 @@ static int tandem_validate_request(struct adi_tandem_agc *st,
 
 static int tandem_release_locked(struct adi_tandem_agc *st)
 {
-	int ret;
+	int quiesce_ret, retire_ret = 0, restore_ret;
 
 	if (!st->acquired && !st->permanent_fault)
 		return 0;
@@ -258,15 +318,23 @@ static int tandem_release_locked(struct adi_tandem_agc *st)
 
 	/* Stop decisions but retain actively-low FPGA pin ownership. */
 	tandem_write(st, TANDEM_REG_CONTROL, TANDEM_CONTROL_OWN);
-	usleep_range(50, 100);
-	ret = ad9361_tandem_release(st->phy, st);
+	quiesce_ret = tandem_wait_quiescent(st, !st->acquired);
+	if (!quiesce_ret)
+		retire_ret = tandem_retire_events_locked(st);
+	restore_ret = ad9361_tandem_release(st->phy, st);
 	/* Pin control is disarmed; only now may the mux return to PS/high-Z. */
 	tandem_write(st, TANDEM_REG_CONTROL, 0);
-	if (ret && ret != -EPERM)
+	if (restore_ret && restore_ret != -EPERM)
 		st->permanent_fault = true;
+	if (quiesce_ret || retire_ret)
+		st->software_fault |= ADI_TANDEM_AGC_FAULT_RADIO_IO;
 	st->acquired = false;
 
-	return ret;
+	if (restore_ret)
+		return restore_ret;
+	if (quiesce_ret)
+		return quiesce_ret;
+	return retire_ret;
 }
 
 static void tandem_watchdog_work(struct work_struct *work)
@@ -283,7 +351,7 @@ static void tandem_watchdog_work(struct work_struct *work)
 		 * though its process still owns the descriptor.
 		 */
 		tandem_release_locked(st);
-		st->software_fault = ADI_TANDEM_AGC_FAULT_WATCHDOG;
+		st->software_fault |= ADI_TANDEM_AGC_FAULT_WATCHDOG;
 	}
 	mutex_unlock(&st->lock);
 }
@@ -305,13 +373,12 @@ static int tandem_acquire_locked(struct adi_tandem_agc *st,
 			req->small_adc_overload_threshold,
 	};
 	u32 control;
-	int ret;
+	int cleanup_ret = 0, release_ret, ret;
 
 	if (st->acquired)
 		return -EBUSY;
 	if (st->permanent_fault)
 		return -EIO;
-	st->software_fault = 0;
 	ret = tandem_validate_request(st, req);
 	if (ret)
 		return ret;
@@ -320,7 +387,7 @@ static int tandem_acquire_locked(struct adi_tandem_agc *st,
 	tandem_write(st, TANDEM_REG_CONTROL, 0);
 	ret = ad9361_tandem_prepare(st->phy, st, &radio_config, &st->gain);
 	if (ret) {
-		int release_ret = ad9361_tandem_release(st->phy, st);
+		release_ret = ad9361_tandem_release(st->phy, st);
 
 		if (release_ret && release_ret != -EPERM)
 			st->permanent_fault = true;
@@ -353,8 +420,10 @@ static int tandem_acquire_locked(struct adi_tandem_agc *st,
 	ret = readl_poll_timeout(st->regs + TANDEM_REG_FAULT, control,
 				 !(control), 1, 10000);
 	if (ret)
-		goto err_restore;
+		goto err_disarm;
 	tandem_write(st, TANDEM_REG_CONTROL, 0);
+	/* A prior software fault is recovered only after hardware CLEAR landed. */
+	st->software_fault = 0;
 
 	if (tandem_read(st, TANDEM_REG_EPOCH) != st->epoch ||
 	    (tandem_read(st, TANDEM_REG_GAIN_LIMITS) & GENMASK(23, 0)) !=
@@ -362,7 +431,7 @@ static int tandem_acquire_locked(struct adi_tandem_agc *st,
 	     st->gain.maximum_gain_index << 8 |
 	     st->gain.initial_gain_index << 16)) {
 		ret = -EIO;
-		goto err_restore;
+		goto err_disarm;
 	}
 
 	control = TANDEM_CONTROL_OWN;
@@ -400,9 +469,13 @@ static int tandem_acquire_locked(struct adi_tandem_agc *st,
 err_release:
 err_disarm:
 	tandem_write(st, TANDEM_REG_CONTROL, TANDEM_CONTROL_OWN);
-	usleep_range(50, 100);
-err_restore:
-	if (ad9361_tandem_release(st->phy, st))
+	cleanup_ret = tandem_wait_quiescent(st, false);
+	if (!cleanup_ret)
+		cleanup_ret = tandem_retire_events_locked(st);
+	if (cleanup_ret)
+		st->software_fault |= ADI_TANDEM_AGC_FAULT_RADIO_IO;
+	release_ret = ad9361_tandem_release(st->phy, st);
+	if (release_ret && release_ret != -EPERM)
 		st->permanent_fault = true;
 	tandem_write(st, TANDEM_REG_CONTROL, 0);
 	return ret;
