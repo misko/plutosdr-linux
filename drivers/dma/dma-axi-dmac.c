@@ -14,6 +14,7 @@
 #include <linux/err.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
@@ -84,6 +85,15 @@
 #define AXI_DMAC_REG_DBG2		0x444
 #define AXI_DMAC_REG_PARTIAL_XFER_LEN	0x44c
 #define AXI_DMAC_REG_PARTIAL_XFER_ID	0x450
+
+/*
+ * With CTRL_ENABLE cleared the HDL reset manager first drains outstanding
+ * interface transactions and then resets every clock domain.  DBG0 reaches
+ * this value only after that sequence is complete and the core is disabled.
+ */
+#define AXI_DMAC_DBG0_RESET_COMPLETE	0x701
+#define AXI_DMAC_DBG0_RESET_MASK		GENMASK(11, 0)
+#define AXI_DMAC_RESET_TIMEOUT_US	100000
 
 #define AXI_DMAC_CTRL_ENABLE		BIT(0)
 #define AXI_DMAC_CTRL_PAUSE		BIT(1)
@@ -461,6 +471,26 @@ static int axi_dmac_terminate_all(struct dma_chan *c)
 static void axi_dmac_synchronize(struct dma_chan *c)
 {
 	struct axi_dmac_chan *chan = to_axi_dmac_chan(c);
+	struct axi_dmac *dmac = chan_to_axi_dmac(chan);
+	unsigned int status;
+	int ret;
+
+	/*
+	 * axi_dmac_terminate_all() is also the atomic terminate operation, so it
+	 * can only request shutdown.  The synchronous DMAengine contract requires
+	 * us to wait here until the hardware has stopped touching descriptor
+	 * memory.  Without this fence a rapid disable/re-enable can submit the new
+	 * descriptor while the HDL is still resetting; the request is then lost
+	 * and the channel produces no further completions until a system reset.
+	 */
+	ret = readl_poll_timeout(dmac->base + AXI_DMAC_REG_DBG0, status,
+		(status & AXI_DMAC_DBG0_RESET_MASK) ==
+			AXI_DMAC_DBG0_RESET_COMPLETE,
+		1, AXI_DMAC_RESET_TIMEOUT_US);
+	if (ret)
+		dev_err(dmac->dma_dev.dev,
+			"Timed out waiting for DMA shutdown (DBG0=0x%08x)\n",
+			status);
 
 	vchan_synchronize(&chan->vchan);
 }
