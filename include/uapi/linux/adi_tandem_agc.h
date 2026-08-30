@@ -11,6 +11,7 @@
 #define ADI_TANDEM_AGC_FEATURE_EVENTS		(1U << 0)
 #define ADI_TANDEM_AGC_FEATURE_FAIL_CLOSED	(1U << 1)
 #define ADI_TANDEM_AGC_FEATURE_PAIRED_GAIN	(1U << 2)
+#define ADI_TANDEM_AGC_FEATURE_SAMPLE_FENCE	(1U << 3)
 
 #define ADI_TANDEM_AGC_POLICY_FAIL_SESSION	0U
 
@@ -99,7 +100,13 @@ struct adi_tandem_agc_status {
 	__u8 rx2_gain_index;
 	__u32 gain_table_id;
 	__u32 threshold_provenance;
-	__u32 reserved[6];
+	/*
+	 * Low word of the exclusive RX sample boundary captured in the same
+	 * receive-domain status snapshot as transition_count.  A reader must
+	 * compare modulo 2^32 and keep its admitted window below 2^31 samples.
+	 */
+	__u32 sample_counter_fence_low;
+	__u32 reserved[5];
 };
 
 struct adi_tandem_agc_acquire {
@@ -124,5 +131,7 @@ struct adi_tandem_agc_event {
 	_IOWR(ADI_TANDEM_AGC_IOC_MAGIC, 0x02, struct adi_tandem_agc_acquire)
 #define ADI_TANDEM_AGC_IOC_RELEASE \
 	_IO(ADI_TANDEM_AGC_IOC_MAGIC, 0x03)
+#define ADI_TANDEM_AGC_IOC_START_AUTO \
+	_IO(ADI_TANDEM_AGC_IOC_MAGIC, 0x04)
 
 #endif /* _UAPI_LINUX_ADI_TANDEM_AGC_H */

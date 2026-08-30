@@ -48,9 +48,10 @@
 #define TANDEM_REG_EVENT_WORD1		0x48
 #define TANDEM_REG_EVENT_WORD2		0x4c
 #define TANDEM_REG_EVENT_WORD3_POP	0x50
+#define TANDEM_REG_SAMPLE_FENCE_LOW	0x54
 
 #define TANDEM_FPGA_ID			0x54414732U /* "TAG2" */
-#define TANDEM_FPGA_ABI			1U
+#define TANDEM_FPGA_ABI			2U
 #define TANDEM_WATCHDOG_TIMEOUT		(5 * HZ)
 #define TANDEM_FIFO_POP_TIMEOUT_US	10000
 
@@ -67,6 +68,8 @@
 	(ADI_TANDEM_AGC_FEATURE_EVENTS | \
 	 ADI_TANDEM_AGC_FEATURE_FAIL_CLOSED | \
 	 ADI_TANDEM_AGC_FEATURE_PAIRED_GAIN)
+#define TANDEM_SUPPORTED_FEATURES \
+	(TANDEM_REQUIRED_FEATURES | ADI_TANDEM_AGC_FEATURE_SAMPLE_FENCE)
 
 enum tandem_attr {
 	TANDEM_ATTR_ABI_VERSION,
@@ -82,6 +85,7 @@ enum tandem_attr {
 	TANDEM_ATTR_RX2_GAIN_INDEX,
 	TANDEM_ATTR_TRANSITIONS,
 	TANDEM_ATTR_OVERFLOWS,
+	TANDEM_ATTR_SAMPLE_FENCE_LOW,
 };
 
 struct adi_tandem_agc {
@@ -188,6 +192,15 @@ static int tandem_retire_events_locked(struct adi_tandem_agc *st)
 static void tandem_fill_status(struct adi_tandem_agc *st,
 			       struct adi_tandem_agc_status *status)
 {
+	/*
+	 * Read the receive-domain fence first.  TRANSITION_COUNT is read later,
+	 * so it comes from either that exact coherent status snapshot or a newer
+	 * one.  The returned transition watermark therefore covers every gain
+	 * decision strictly before sample_counter_fence_low without requiring an
+	 * atomic multi-register AXI transaction.
+	 */
+	u32 sample_counter_fence_low =
+		tandem_read(st, TANDEM_REG_SAMPLE_FENCE_LOW);
 	u32 gain_current = tandem_read(st, TANDEM_REG_GAIN_CURRENT);
 
 	memset(status, 0, sizeof(*status));
@@ -214,6 +227,7 @@ static void tandem_fill_status(struct adi_tandem_agc *st,
 	status->rx2_gain_index = gain_current >> 8;
 	status->gain_table_id = st->gain.gain_table_id;
 	status->threshold_provenance = tandem_read(st, TANDEM_REG_THRESHOLDS);
+	status->sample_counter_fence_low = sample_counter_fence_low;
 }
 
 static void tandem_verify_radio_locked(struct adi_tandem_agc *st)
@@ -481,6 +495,51 @@ err_disarm:
 	return ret;
 }
 
+static int tandem_start_auto_locked(struct adi_tandem_agc *st)
+{
+	u32 control, status;
+	int hold_ret, ret;
+
+	if (!st->acquired)
+		return -ENODATA;
+	if (st->permanent_fault || st->software_fault ||
+	    tandem_read(st, TANDEM_REG_FAULT))
+		return -EIO;
+	control = tandem_read(st, TANDEM_REG_CONTROL);
+	status = tandem_read(st, TANDEM_REG_STATUS) & TANDEM_STATUS_STATE_MASK;
+	if ((control & TANDEM_CONTROL_AUTO) ||
+	    status == ADI_TANDEM_AGC_STATE_ARMED_AUTO)
+		return -EALREADY;
+	if (!(control & TANDEM_CONTROL_OWN) ||
+	    status != ADI_TANDEM_AGC_STATE_ARMED_HOLD)
+		return -EPROTO;
+
+	/*
+	 * Authoritative providers acquire in HOLD, arm the DMA queue, and only
+	 * then issue START_AUTO.  This preserves a zero-transition/event-sequence
+	 * seed while ensuring every later AUTO event belongs to an armed capture.
+	 */
+	tandem_write(st, TANDEM_REG_CONTROL,
+		     TANDEM_CONTROL_OWN | TANDEM_CONTROL_AUTO);
+	ret = tandem_wait_state(st, ADI_TANDEM_AGC_STATE_ARMED_AUTO);
+	if (!ret && (tandem_read(st, TANDEM_REG_STATUS) & TANDEM_STATUS_FAULT))
+		ret = -EIO;
+	if (ret) {
+		/*
+		 * Fail closed in owned HOLD.  Descriptor teardown remains responsible
+		 * for restoring the radio and returning the pins to the processor.
+		 */
+		tandem_write(st, TANDEM_REG_CONTROL, TANDEM_CONTROL_OWN);
+		hold_ret = tandem_wait_state(st,
+					     ADI_TANDEM_AGC_STATE_ARMED_HOLD);
+		if (hold_ret)
+			st->software_fault |= ADI_TANDEM_AGC_FAULT_RADIO_IO;
+		return ret;
+	}
+	tandem_heartbeat_locked(st);
+	return 0;
+}
+
 static int tandem_open(struct inode *inode, struct file *file)
 {
 	struct miscdevice *miscdev = file->private_data;
@@ -528,7 +587,7 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 		memset(&caps, 0, sizeof(caps));
 		caps.version = ADI_TANDEM_AGC_ABI_VERSION;
 		caps.size = sizeof(caps);
-		caps.features = TANDEM_REQUIRED_FEATURES;
+		caps.features = TANDEM_SUPPORTED_FEATURES;
 		caps.fpga_identity = tandem_read(st, TANDEM_REG_ID);
 		caps.fpga_abi = tandem_read(st, TANDEM_REG_ABI);
 		caps.event_size = sizeof(struct adi_tandem_agc_event);
@@ -556,6 +615,9 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 		break;
 	case ADI_TANDEM_AGC_IOC_RELEASE:
 		ret = tandem_release_locked(st);
+		break;
+	case ADI_TANDEM_AGC_IOC_START_AUTO:
+		ret = tandem_start_auto_locked(st);
 		break;
 	default:
 		ret = -ENOTTY;
@@ -647,7 +709,7 @@ static ssize_t tandem_attr_show(struct device *dev,
 		value = tandem_read(st, TANDEM_REG_ABI);
 		break;
 	case TANDEM_ATTR_FEATURES:
-		value = TANDEM_REQUIRED_FEATURES;
+		value = TANDEM_SUPPORTED_FEATURES;
 		break;
 	case TANDEM_ATTR_STATE:
 		value = (st->permanent_fault || st->software_fault) ?
@@ -682,6 +744,9 @@ static ssize_t tandem_attr_show(struct device *dev,
 	case TANDEM_ATTR_OVERFLOWS:
 		value = tandem_read(st, TANDEM_REG_OVERFLOW_COUNT);
 		break;
+	case TANDEM_ATTR_SAMPLE_FENCE_LOW:
+		value = tandem_read(st, TANDEM_REG_SAMPLE_FENCE_LOW);
+		break;
 	default:
 		mutex_unlock(&st->lock);
 		return -EINVAL;
@@ -707,6 +772,7 @@ static TANDEM_ATTR_RO(rx1_gain_index, TANDEM_ATTR_RX1_GAIN_INDEX);
 static TANDEM_ATTR_RO(rx2_gain_index, TANDEM_ATTR_RX2_GAIN_INDEX);
 static TANDEM_ATTR_RO(transition_count, TANDEM_ATTR_TRANSITIONS);
 static TANDEM_ATTR_RO(overflow_count, TANDEM_ATTR_OVERFLOWS);
+static TANDEM_ATTR_RO(sample_counter_fence_low, TANDEM_ATTR_SAMPLE_FENCE_LOW);
 
 static struct attribute *tandem_attrs[] = {
 	&iio_dev_attr_abi_version.dev_attr.attr,
@@ -722,6 +788,7 @@ static struct attribute *tandem_attrs[] = {
 	&iio_dev_attr_rx2_gain_index.dev_attr.attr,
 	&iio_dev_attr_transition_count.dev_attr.attr,
 	&iio_dev_attr_overflow_count.dev_attr.attr,
+	&iio_dev_attr_sample_counter_fence_low.dev_attr.attr,
 	NULL,
 };
 
