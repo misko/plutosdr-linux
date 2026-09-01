@@ -269,6 +269,7 @@ CONFIG_DMA_CMA=y
 # 216 MiB pool holds fifty 1,000,000-IQ-sample ABI-3 buffers in a 200 MiB CMA
 # span while leaving 16 MiB of coherent-allocation headroom.
 CONFIG_CMA_SIZE_MBYTES=216
+CONFIG_CMA_ALIGNMENT=8
 CONFIG_DEBUG_INFO=y
 CONFIG_DEBUG_FS=y
 CONFIG_DETECT_HUNG_TASK=y
