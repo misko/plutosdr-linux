@@ -113,6 +113,8 @@
 
 	one-bit-adc-dac@0 {
 		compatible = "adi,one-bit-adc-dac";
+		/* RX-only shell has no TDD/phaser datapath; keep its GPIO mux inert. */
+		status = "disabled";
 
 		#address-cells = <1>;
 		#size-cells = <0>;
