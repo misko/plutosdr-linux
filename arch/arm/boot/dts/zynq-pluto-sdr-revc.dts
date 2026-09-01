@@ -21,12 +21,14 @@
 	axi_tdd_0: axi-tdd-0@7C440000 {
 		compatible = "adi,axi-tdd";
 		reg = <0x7C440000 0x10000>;
+		status = "disabled";
 		clocks = <&clkc 15>, <&adc0_ad9364 20>;
 		clock-names = "s_axi_aclk", "intf_clk";
 	};
 
 	iio_axi_tdd_0@0 {
 		compatible = "adi,iio-fake-platform-device";
+		status = "disabled";
 		adi,faked-dev = <&axi_tdd_0>;
 		adi,attribute-names =
 		"version", "core_id", "scratch", "magic",
@@ -71,8 +73,7 @@
 };
 
 &adc0_ad9364 {
-	/* This property is controlled by u-boot environment. */
-	adi,2rx-2tx-mode-enable;
+	/* The RX-only FPGA shell is compile-time 1R1T. */
 };
 
 &cf_ad9364_dac_core_0 {
@@ -281,4 +282,3 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&pinctrl_gpio0_default>;
 };
-

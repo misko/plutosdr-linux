@@ -11,6 +11,7 @@
 
 / {
 	model = "Analog Devices PlutoSDR Rev.A (Z7010/AD9363)";
+	misko,rx-only-fpga;
 	memory {
 		device_type = "memory";
 		reg = <0x00000000 0x20000000>;
@@ -131,6 +132,7 @@
 			compatible = "adi,tandem-agc-2.00.a";
 			reg = <0x7c450000 0x1000>;
 			spibus-connected = <&adc0_ad9364>;
+			status = "disabled";
 		};
 
 		rx_dma: dma@7c400000 {
@@ -146,7 +148,7 @@
 
 				dma-channel@0 {
 					reg = <0>;
-					adi,source-bus-width = <32>;
+					adi,source-bus-width = <64>;
 					adi,source-bus-type = <2>;
 					adi,destination-bus-width = <64>;
 					adi,destination-bus-type = <0>;
@@ -157,6 +159,7 @@
 		tx_dma: dma@7c420000 {
 			compatible = "adi,axi-dmac-1.00.a";
 			reg = <0x7c420000 0x1000>;
+			status = "disabled";
 			#dma-cells = <1>;
 			interrupts = <0 56 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc 16>;
@@ -187,6 +190,7 @@
 		cf_ad9364_dac_core_0: cf-ad9361-dds-core-lpc@79024000 {
 			compatible = "adi,axi-ad9364-dds-6.00.a";
 			reg = <0x79024000 0x1000>;
+			status = "disabled";
 			clocks = <&adc0_ad9364 13>;
 			clock-names = "sampl_clk";
 			dmas = <&tx_dma 0>;
@@ -240,7 +244,7 @@
 		adi,full-port-enable;
 		adi,digital-interface-tune-fir-disable;
 
-		adi,digital-interface-tune-skip-mode = <0>; /* TUNE RX & TX */
+		adi,digital-interface-tune-skip-mode = <1>; /* RX-only: skip TX */
 		adi,tx-fb-clock-delay = <0>;
 		adi,tx-data-delay = <9>;
 		adi,swap-ports-enable;
@@ -250,7 +254,7 @@
 		//adi,split-gain-table-mode-enable;
 
 		/* ENSM Mode */
-		adi,frequency-division-duplex-mode-enable;
+		/* RX-only: omit FDD so the SPI-controlled ENSM settles in RX. */
 		//adi,ensm-enable-pin-pulse-mode-enable;
 		//adi,ensm-enable-txnrx-control-enable;
 
