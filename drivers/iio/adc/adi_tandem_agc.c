@@ -24,6 +24,7 @@
 #include <linux/workqueue.h>
 
 #include <linux/adi_tandem_agc.h>
+#include <linux/adi_persistent_hop.h>
 
 #include "ad9361.h"
 
@@ -48,9 +49,14 @@
 #define TANDEM_REG_EVENT_WORD1		0x48
 #define TANDEM_REG_EVENT_WORD2		0x4c
 #define TANDEM_REG_EVENT_WORD3_POP	0x50
+#define TANDEM_REG_SAMPLE_COUNTER_LO	0x54
+#define TANDEM_REG_SAMPLE_COUNTER_HI	0x58
 
 #define TANDEM_FPGA_ID			0x54414732U /* "TAG2" */
-#define TANDEM_FPGA_ABI			1U
+#define TANDEM_FPGA_ABI_V1		1U
+#define TANDEM_FPGA_ABI_V2		2U
+#define TANDEM_FPGA_FEATURES_V1		GENMASK(2, 0)
+#define TANDEM_FPGA_FEATURE_COUNTER64	BIT(3)
 #define TANDEM_WATCHDOG_TIMEOUT		(5 * HZ)
 #define TANDEM_FIFO_POP_TIMEOUT_US	10000
 
@@ -98,6 +104,12 @@ struct adi_tandem_agc {
 	u32 software_fault;
 	u32 epoch;
 	u32 fifo_depth;
+	u32 fpga_abi;
+	u32 fpga_features;
+	u64 hop_original_lo_hz;
+	u32 hop_original_profile;
+	u64 hop_next_event_id;
+	bool hop_started;
 	struct ad9361_tandem_result gain;
 	struct delayed_work watchdog_work;
 };
@@ -110,6 +122,51 @@ static u32 tandem_read(struct adi_tandem_agc *st, unsigned int reg)
 static void tandem_write(struct adi_tandem_agc *st, unsigned int reg, u32 val)
 {
 	iowrite32(val, st->regs + reg);
+}
+
+static u64 tandem_counter_read(struct adi_tandem_agc *st)
+{
+	u32 high_before, high_after, low;
+
+	do {
+		high_before = tandem_read(st, TANDEM_REG_SAMPLE_COUNTER_HI);
+		low = tandem_read(st, TANDEM_REG_SAMPLE_COUNTER_LO);
+		high_after = tandem_read(st, TANDEM_REG_SAMPLE_COUNTER_HI);
+	} while (high_before != high_after);
+
+	return (u64)high_after << 32 | low;
+}
+
+static int tandem_counter_after(struct adi_tandem_agc *st, u64 floor,
+				u64 *counter)
+{
+	unsigned int attempt;
+
+	for (attempt = 0; attempt < 10000; attempt++) {
+		*counter = tandem_counter_read(st);
+		if (*counter > floor)
+			return 0;
+		udelay(1);
+	}
+	return -ETIMEDOUT;
+}
+
+static bool words_are_zero(const u32 *words, size_t count)
+{
+	size_t i;
+
+	for (i = 0; i < count; i++)
+		if (words[i])
+			return false;
+	return true;
+}
+
+static bool persistent_hop_supported(const struct adi_tandem_agc *st)
+{
+	return st->fpga_abi >= TANDEM_FPGA_ABI_V2 &&
+		(st->fpga_features & (TANDEM_FPGA_FEATURES_V1 |
+		 TANDEM_FPGA_FEATURE_COUNTER64)) ==
+		(TANDEM_FPGA_FEATURES_V1 | TANDEM_FPGA_FEATURE_COUNTER64);
 }
 
 static int tandem_wait_state(struct adi_tandem_agc *st, u32 wanted)
@@ -310,7 +367,9 @@ static int tandem_validate_request(struct adi_tandem_agc *st,
 
 static int tandem_release_locked(struct adi_tandem_agc *st)
 {
-	int quiesce_ret, retire_ret = 0, restore_ret;
+	u64 actual_lo_hz = 0;
+	u32 active_profile = ADI_PERSISTENT_HOP_PROFILE_NONE;
+	int hop_restore_ret = 0, quiesce_ret, retire_ret = 0, restore_ret;
 
 	if (!st->acquired && !st->permanent_fault)
 		return 0;
@@ -321,10 +380,26 @@ static int tandem_release_locked(struct adi_tandem_agc *st)
 	quiesce_ret = tandem_wait_quiescent(st, !st->acquired);
 	if (!quiesce_ret)
 		retire_ret = tandem_retire_events_locked(st);
+	/* The descriptor is also the persistent-hop ownership token. Restore the
+	 * RX synthesizer before releasing tandem ownership, including watchdog and
+	 * process-death paths where userspace cannot issue an explicit receipt.
+	 */
+	if (st->hop_started) {
+		hop_restore_ret = ad9361_tandem_fastlock_restore(st->phy, st,
+				st->hop_original_lo_hz, &actual_lo_hz,
+				&active_profile);
+		if (!hop_restore_ret &&
+		    (actual_lo_hz != st->hop_original_lo_hz ||
+		     active_profile != st->hop_original_profile))
+			hop_restore_ret = -EIO;
+		if (!hop_restore_ret)
+			st->hop_started = false;
+	}
 	restore_ret = ad9361_tandem_release(st->phy, st);
 	/* Pin control is disarmed; only now may the mux return to PS/high-Z. */
 	tandem_write(st, TANDEM_REG_CONTROL, 0);
-	if (restore_ret && restore_ret != -EPERM)
+	if ((hop_restore_ret && hop_restore_ret != -EPERM) ||
+	    (restore_ret && restore_ret != -EPERM))
 		st->permanent_fault = true;
 	if (quiesce_ret || retire_ret)
 		st->software_fault |= ADI_TANDEM_AGC_FAULT_RADIO_IO;
@@ -332,6 +407,8 @@ static int tandem_release_locked(struct adi_tandem_agc *st)
 
 	if (restore_ret)
 		return restore_ret;
+	if (hop_restore_ret)
+		return hop_restore_ret;
 	if (quiesce_ret)
 		return quiesce_ret;
 	return retire_ret;
@@ -512,6 +589,128 @@ static int tandem_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+static int persistent_hop_start_locked(struct adi_tandem_agc *st,
+				       struct adi_persistent_hop_start_v1 *start)
+{
+	u64 actual_lo_hz;
+	u32 active_profile;
+	int ret;
+
+	if (start->version != ADI_PERSISTENT_HOP_ABI_VERSION ||
+	    start->size != sizeof(*start) ||
+	    start->required_features != ADI_PERSISTENT_HOP_REQUIRED_FEATURES ||
+	    !start->expected_original_lo_hz ||
+	    !words_are_zero(start->reserved, ARRAY_SIZE(start->reserved)))
+		return -EINVAL;
+	if (!st->acquired || st->hop_started)
+		return -EBUSY;
+	if (!persistent_hop_supported(st))
+		return -EOPNOTSUPP;
+	ret = ad9361_tandem_fastlock_status(st->phy, st, &actual_lo_hz,
+					     &active_profile);
+	if (ret)
+		return ret;
+	start->actual_original_lo_hz = actual_lo_hz;
+	start->active_profile = active_profile;
+	if (actual_lo_hz != start->expected_original_lo_hz ||
+	    active_profile != ADI_PERSISTENT_HOP_PROFILE_NONE)
+		return -ESTALE;
+	st->hop_original_lo_hz = actual_lo_hz;
+	st->hop_original_profile = active_profile;
+	st->hop_started = true;
+	tandem_heartbeat_locked(st);
+	return 0;
+}
+
+static int persistent_hop_recall_locked(struct adi_tandem_agc *st,
+					struct adi_persistent_hop_transition_v1 *transition)
+{
+	u64 floor;
+	int ret;
+
+	if (transition->version != ADI_PERSISTENT_HOP_ABI_VERSION ||
+	    transition->size != sizeof(*transition) ||
+	    transition->required_features !=
+		ADI_PERSISTENT_HOP_REQUIRED_FEATURES ||
+	    transition->profile >= 8U || !transition->expected_lo_hz ||
+	    !words_are_zero(transition->reserved,
+		ARRAY_SIZE(transition->reserved)))
+		return -EINVAL;
+	if (!st->acquired || !st->hop_started)
+		return -ENODATA;
+	transition->transition_before = tandem_counter_read(st);
+	ret = ad9361_tandem_fastlock_recall(st->phy, st,
+					     transition->profile,
+					     &transition->actual_lo_hz,
+					     &transition->active_profile);
+	if (ret)
+		goto fault;
+	/* First sample a post-operation floor, then require a newer coherent FPGA
+	 * snapshot. transition_after therefore cannot be a stale pre-recall value.
+	 */
+	floor = tandem_counter_read(st);
+	ret = tandem_counter_after(st, floor, &transition->transition_after);
+	if (ret)
+		goto fault;
+	if (transition->active_profile != transition->profile ||
+	    transition->actual_lo_hz != transition->expected_lo_hz) {
+		ret = -ESTALE;
+		goto fault;
+	}
+	st->hop_next_event_id++;
+	if (!st->hop_next_event_id)
+		st->hop_next_event_id++;
+	transition->device_event_id = st->hop_next_event_id;
+	tandem_heartbeat_locked(st);
+	return 0;
+
+fault:
+	st->software_fault |= ADI_TANDEM_AGC_FAULT_RADIO_IO;
+	return ret;
+}
+
+static int persistent_hop_restore_locked(struct adi_tandem_agc *st,
+					 struct adi_persistent_hop_restore_v1 *restore)
+{
+	u64 floor;
+	int ret;
+
+	if (restore->version != ADI_PERSISTENT_HOP_ABI_VERSION ||
+	    restore->size != sizeof(*restore) ||
+	    restore->required_features != ADI_PERSISTENT_HOP_REQUIRED_FEATURES ||
+	    !restore->expected_original_lo_hz ||
+	    !words_are_zero(restore->reserved, ARRAY_SIZE(restore->reserved)))
+		return -EINVAL;
+	if (!st->acquired || !st->hop_started)
+		return -ENODATA;
+	if (restore->expected_original_lo_hz != st->hop_original_lo_hz)
+		return -ESTALE;
+	restore->transition_before = tandem_counter_read(st);
+	ret = ad9361_tandem_fastlock_restore(st->phy, st,
+					      st->hop_original_lo_hz,
+					      &restore->actual_lo_hz,
+					      &restore->active_profile);
+	if (ret)
+		goto fault;
+	floor = tandem_counter_read(st);
+	ret = tandem_counter_after(st, floor, &restore->transition_after);
+	if (ret)
+		goto fault;
+	if (restore->active_profile != st->hop_original_profile ||
+	    restore->actual_lo_hz != st->hop_original_lo_hz) {
+		ret = -ESTALE;
+		goto fault;
+	}
+	st->hop_started = false;
+	tandem_heartbeat_locked(st);
+	return 0;
+
+fault:
+	st->software_fault |= ADI_TANDEM_AGC_FAULT_RESTORE;
+	st->permanent_fault = true;
+	return ret;
+}
+
 static long tandem_ioctl(struct file *file, unsigned int cmd,
 			 unsigned long arg)
 {
@@ -520,6 +719,11 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 	struct adi_tandem_agc_acquire acquire;
 	struct adi_tandem_agc_status status;
 	struct adi_tandem_agc_caps caps;
+	struct adi_persistent_hop_caps_v1 hop_caps;
+	struct adi_persistent_hop_counter_v1 hop_counter;
+	struct adi_persistent_hop_start_v1 hop_start;
+	struct adi_persistent_hop_transition_v1 hop_transition;
+	struct adi_persistent_hop_restore_v1 hop_restore;
 	int ret = 0;
 
 	mutex_lock(&st->lock);
@@ -556,6 +760,60 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 		break;
 	case ADI_TANDEM_AGC_IOC_RELEASE:
 		ret = tandem_release_locked(st);
+		break;
+	case ADI_PERSISTENT_HOP_IOC_GET_CAPS:
+		memset(&hop_caps, 0, sizeof(hop_caps));
+		hop_caps.version = ADI_PERSISTENT_HOP_ABI_VERSION;
+		hop_caps.size = sizeof(hop_caps);
+		hop_caps.features = persistent_hop_supported(st) ?
+			ADI_PERSISTENT_HOP_REQUIRED_FEATURES : 0;
+		hop_caps.maximum_profiles = 8;
+		hop_caps.fpga_identity = tandem_read(st, TANDEM_REG_ID);
+		hop_caps.fpga_abi = st->fpga_abi;
+		if (copy_to_user(argp, &hop_caps, sizeof(hop_caps)))
+			ret = -EFAULT;
+		break;
+	case ADI_PERSISTENT_HOP_IOC_GET_COUNTER:
+		if (!st->acquired || !persistent_hop_supported(st)) {
+			ret = -ENODATA;
+			break;
+		}
+		memset(&hop_counter, 0, sizeof(hop_counter));
+		hop_counter.version = ADI_PERSISTENT_HOP_ABI_VERSION;
+		hop_counter.size = sizeof(hop_counter);
+		hop_counter.sample_counter = tandem_counter_read(st);
+		tandem_heartbeat_locked(st);
+		if (copy_to_user(argp, &hop_counter, sizeof(hop_counter)))
+			ret = -EFAULT;
+		break;
+	case ADI_PERSISTENT_HOP_IOC_START:
+		if (copy_from_user(&hop_start, argp, sizeof(hop_start))) {
+			ret = -EFAULT;
+			break;
+		}
+		ret = persistent_hop_start_locked(st, &hop_start);
+		if (!ret && copy_to_user(argp, &hop_start, sizeof(hop_start)))
+			ret = -EFAULT;
+		break;
+	case ADI_PERSISTENT_HOP_IOC_RECALL:
+		if (copy_from_user(&hop_transition, argp,
+				   sizeof(hop_transition))) {
+			ret = -EFAULT;
+			break;
+		}
+		ret = persistent_hop_recall_locked(st, &hop_transition);
+		if (!ret && copy_to_user(argp, &hop_transition,
+					 sizeof(hop_transition)))
+			ret = -EFAULT;
+		break;
+	case ADI_PERSISTENT_HOP_IOC_RESTORE:
+		if (copy_from_user(&hop_restore, argp, sizeof(hop_restore))) {
+			ret = -EFAULT;
+			break;
+		}
+		ret = persistent_hop_restore_locked(st, &hop_restore);
+		if (!ret && copy_to_user(argp, &hop_restore, sizeof(hop_restore)))
+			ret = -EFAULT;
 		break;
 	default:
 		ret = -ENOTTY;
@@ -762,8 +1020,11 @@ static int adi_tandem_agc_probe(struct platform_device *pdev)
 	st->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(st->regs))
 		return PTR_ERR(st->regs);
-	if (tandem_read(st, TANDEM_REG_ID) != TANDEM_FPGA_ID ||
-	    tandem_read(st, TANDEM_REG_ABI) != TANDEM_FPGA_ABI)
+	if (tandem_read(st, TANDEM_REG_ID) != TANDEM_FPGA_ID)
+		return -ENODEV;
+	st->fpga_abi = tandem_read(st, TANDEM_REG_ABI);
+	if (st->fpga_abi != TANDEM_FPGA_ABI_V1 &&
+	    st->fpga_abi != TANDEM_FPGA_ABI_V2)
 		return -ENODEV;
 
 	spi_np = of_parse_phandle(pdev->dev.of_node, "spibus-connected", 0);
@@ -785,6 +1046,7 @@ static int adi_tandem_agc_probe(struct platform_device *pdev)
 		return ret;
 
 	caps = tandem_read(st, TANDEM_REG_CAPS);
+	st->fpga_features = caps >> 16;
 	st->fifo_depth = caps & TANDEM_CAP_FIFO_DEPTH_MASK;
 	if (!st->fifo_depth)
 		return -EINVAL;

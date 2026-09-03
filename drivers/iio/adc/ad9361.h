@@ -218,6 +218,14 @@ int ad9361_tandem_arm(struct ad9361_rf_phy *phy, void *owner);
 int ad9361_tandem_verify(struct ad9361_rf_phy *phy, void *owner,
 			 u8 expected_rx1, u8 expected_rx2);
 int ad9361_tandem_release(struct ad9361_rf_phy *phy, void *owner);
+int ad9361_tandem_fastlock_status(struct ad9361_rf_phy *phy, void *owner,
+				  u64 *lo_hz, u32 *active_profile);
+int ad9361_tandem_fastlock_recall(struct ad9361_rf_phy *phy, void *owner,
+				  u32 profile, u64 *lo_hz,
+				  u32 *active_profile);
+int ad9361_tandem_fastlock_restore(struct ad9361_rf_phy *phy, void *owner,
+				   u64 lo_hz, u64 *actual_lo_hz,
+				   u32 *active_profile);
 int ad9361_set_tx_port(struct ad9361_rf_phy *phy, enum tx_port_sel sel);
 bool ad9361_bb_clk_change_dig_tune_en(struct ad9361_rf_phy *phy);
 u32 ad9361_get_dig_interface_tune_skipmode(struct ad9361_rf_phy *phy);

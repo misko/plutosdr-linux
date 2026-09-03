@@ -4996,6 +4996,90 @@ static int ad9361_fastlock_recall(struct ad9361_rf_phy *phy, bool tx, u32 profil
 			 RX_FAST_LOCK_MODE_ENABLE);
 }
 
+int ad9361_tandem_fastlock_status(struct ad9361_rf_phy *phy, void *owner,
+				  u64 *lo_hz, u32 *active_profile)
+{
+	struct ad9361_rf_phy_state *st;
+	int ret = 0;
+
+	if (!phy || !owner || !lo_hz || !active_profile)
+		return -EINVAL;
+	st = phy->state;
+	mutex_lock(&phy->lock);
+	if (phy->tandem_owner != owner) {
+		ret = -EPERM;
+		goto out;
+	}
+	*lo_hz = ad9361_from_clk(clk_get_rate(phy->clks[RX_RFPLL]));
+	*active_profile = st->fastlock.current_profile[0] ?
+		st->fastlock.current_profile[0] - 1U : U32_MAX;
+out:
+	mutex_unlock(&phy->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ad9361_tandem_fastlock_status);
+
+int ad9361_tandem_fastlock_recall(struct ad9361_rf_phy *phy, void *owner,
+				  u32 profile, u64 *lo_hz,
+				  u32 *active_profile)
+{
+	struct ad9361_rf_phy_state *st;
+	int ret;
+
+	if (!phy || !owner || !lo_hz || !active_profile || profile >= 8U)
+		return -EINVAL;
+	st = phy->state;
+	mutex_lock(&phy->lock);
+	if (phy->tandem_owner != owner) {
+		ret = -EPERM;
+		goto out;
+	}
+	ret = ad9361_fastlock_recall(phy, false, profile);
+	if (ret)
+		goto out;
+	*lo_hz = ad9361_from_clk(clk_get_rate(phy->clks[RX_RFPLL]));
+	*active_profile = st->fastlock.current_profile[0] ?
+		st->fastlock.current_profile[0] - 1U : U32_MAX;
+	if (*active_profile != profile)
+		ret = -EIO;
+out:
+	mutex_unlock(&phy->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ad9361_tandem_fastlock_recall);
+
+int ad9361_tandem_fastlock_restore(struct ad9361_rf_phy *phy, void *owner,
+				   u64 lo_hz, u64 *actual_lo_hz,
+				   u32 *active_profile)
+{
+	struct ad9361_rf_phy_state *st;
+	int ret;
+
+	if (!phy || !owner || !lo_hz || !actual_lo_hz || !active_profile)
+		return -EINVAL;
+	st = phy->state;
+	mutex_lock(&phy->lock);
+	if (phy->tandem_owner != owner) {
+		ret = -EPERM;
+		goto out;
+	}
+	ret = ad9361_fastlock_prepare(phy, false, 0, false);
+	if (ret)
+		goto out;
+	ret = clk_set_rate(phy->clks[RX_RFPLL], ad9361_to_clk(lo_hz));
+	if (ret)
+		goto out;
+	*actual_lo_hz = ad9361_from_clk(clk_get_rate(phy->clks[RX_RFPLL]));
+	*active_profile = st->fastlock.current_profile[0] ?
+		st->fastlock.current_profile[0] - 1U : U32_MAX;
+	if (*active_profile != U32_MAX || *actual_lo_hz != lo_hz)
+		ret = -EIO;
+out:
+	mutex_unlock(&phy->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ad9361_tandem_fastlock_restore);
+
 static int ad9361_fastlock_save(struct ad9361_rf_phy *phy, bool tx,
 				u32 profile, u8 *values)
 {
