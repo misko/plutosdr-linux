@@ -99,7 +99,6 @@ enum pss_attr {
 
 struct pss_scan {
 	u32 words[PSS_RESULT_WORDS];
-	s64 timestamp __aligned(8);
 };
 
 struct adi_starlink_pss_tracker {
@@ -147,7 +146,6 @@ static const struct iio_chan_spec pss_channels[] = {
 			.endianness = IIO_LE,
 		},
 	},
-	IIO_CHAN_SOFT_TIMESTAMP(1),
 };
 
 static u32 pss_read(struct adi_starlink_pss_tracker *st, unsigned int reg)
@@ -318,8 +316,7 @@ static irqreturn_t pss_irq_thread(int irq, void *private)
 		return IRQ_HANDLED;
 	}
 
-	ret = iio_push_to_buffers_with_timestamp(indio_dev, &scan,
-					 iio_get_time_ns(indio_dev));
+	ret = iio_push_to_buffers(indio_dev, &scan);
 	if (ret) {
 		st->fault_flags |= PSS_FAULT_BUFFER_FULL;
 		st->buffer_push_failures++;

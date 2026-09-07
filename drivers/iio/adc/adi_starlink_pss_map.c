@@ -3,10 +3,13 @@
  * Starlink PSS coarse phase-map IIO driver
  *
  * One hardware map is 20,000 u16 bins.  IIO scan_type.repeat is u8, so maps
- * are transported as 200 self-describing scans of 100 bins.  Generation,
- * start index, chunk ordinal, and first-bin metadata make reassembly and
- * incomplete-map rejection deterministic.  A hardware bank is released only
- * after every chunk has entered the IIO kfifo.
+ * are transported as 200 self-describing scans.  Each scan is one indivisible
+ * array of 59 u32 words: nine metadata words followed by 100 packed u16 bins.
+ * A single repeated channel avoids the full-array alignment gap that Linux IIO
+ * inserts between separate repeated channels.  Generation, start index, chunk
+ * ordinal, and first-bin metadata make reassembly and incomplete-map rejection
+ * deterministic.  A hardware bank is released only after every chunk has
+ * entered the IIO kfifo.
  */
 #include <linux/bitfield.h>
 #include <linux/iio/buffer.h>
@@ -76,6 +79,7 @@
 #define MAP_CHUNK_BINS                     100U
 #define MAP_CHUNKS                         (MAP_PHASE_BINS / MAP_CHUNK_BINS)
 #define MAP_META_WORDS                     9U
+#define MAP_CHUNK_WORDS                    (MAP_META_WORDS + MAP_CHUNK_BINS / 2U)
 
 #define MAP_STATUS_EPOCH_LIVE              BIT(0)
 #define MAP_STATUS_ENABLED                 BIT(1)
@@ -122,9 +126,7 @@ struct map_snapshot {
 };
 
 struct map_scan {
-	u32 metadata[MAP_META_WORDS];
-	u16 bins[MAP_CHUNK_BINS];
-	s64 timestamp __aligned(8);
+	u32 words[MAP_CHUNK_WORDS];
 };
 
 struct adi_starlink_pss_map {
@@ -150,30 +152,16 @@ static const struct iio_chan_spec map_channels[] = {
 		.type = IIO_COUNT,
 		.indexed = 1,
 		.channel = 0,
-		.extend_name = "chunk_metadata",
+		.extend_name = "chunk_words",
 		.scan_index = 0,
 		.scan_type = {
 			.sign = 'u',
 			.realbits = 32,
 			.storagebits = 32,
-			.repeat = MAP_META_WORDS,
-			.endianness = IIO_LE,
-		},
-	}, {
-		.type = IIO_INTENSITY,
-		.indexed = 1,
-		.channel = 0,
-		.extend_name = "phase_bins",
-		.scan_index = 1,
-		.scan_type = {
-			.sign = 'u',
-			.realbits = 16,
-			.storagebits = 16,
-			.repeat = MAP_CHUNK_BINS,
+			.repeat = MAP_CHUNK_WORDS,
 			.endianness = IIO_LE,
 		},
 	},
-	IIO_CHAN_SOFT_TIMESTAMP(2),
 };
 
 static u32 map_read(struct adi_starlink_pss_map *st, unsigned int reg)
@@ -331,19 +319,19 @@ static int map_push_chunks_locked(struct adi_starlink_pss_map *st,
 
 	for (chunk = 0; chunk < MAP_CHUNKS; chunk++) {
 		memset(&scan, 0, sizeof(scan));
-		scan.metadata[0] = MAP_CHUNK_MAGIC;
-		scan.metadata[1] = st->version;
-		scan.metadata[2] = snapshot->map_generation[bank];
-		scan.metadata[3] = chunk;
-		scan.metadata[4] = MAP_CHUNKS;
-		scan.metadata[5] = lower_32_bits(snapshot->start_index[bank]);
-		scan.metadata[6] = upper_32_bits(snapshot->start_index[bank]);
-		scan.metadata[7] = chunk * MAP_CHUNK_BINS;
-		scan.metadata[8] = MAP_CHUNK_BINS;
-		memcpy(scan.bins, &st->map[chunk * MAP_CHUNK_BINS],
-		       sizeof(scan.bins));
-		ret = iio_push_to_buffers_with_timestamp(st->indio_dev, &scan,
-						 iio_get_time_ns(st->indio_dev));
+		scan.words[0] = MAP_CHUNK_MAGIC;
+		scan.words[1] = st->version;
+		scan.words[2] = snapshot->map_generation[bank];
+		scan.words[3] = chunk;
+		scan.words[4] = MAP_CHUNKS;
+		scan.words[5] = lower_32_bits(snapshot->start_index[bank]);
+		scan.words[6] = upper_32_bits(snapshot->start_index[bank]);
+		scan.words[7] = chunk * MAP_CHUNK_BINS;
+		scan.words[8] = MAP_CHUNK_BINS;
+		memcpy(&scan.words[MAP_META_WORDS],
+		       &st->map[chunk * MAP_CHUNK_BINS],
+		       MAP_CHUNK_BINS * sizeof(*st->map));
+		ret = iio_push_to_buffers(st->indio_dev, &scan);
 		if (ret)
 			return ret;
 		st->chunks_delivered++;
