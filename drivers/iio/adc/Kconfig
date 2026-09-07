@@ -404,6 +404,32 @@ config ADI_TANDEM_AGC
 	  To compile this driver as a module, choose M here: the module will be
 	  called adi_tandem_agc.
 
+config ADI_STARLINK_PSS_TRACKER
+	tristate "Starlink PSS sparse fine-timing tracker"
+	depends on OF && HAS_IOMEM
+	select IIO_BUFFER
+	select IIO_KFIFO_BUF
+	help
+	  Native buffered IIO interface for the experimental FPGA PSS tracker.
+	  Each scan contains one immutable 26-word result packet; the FPGA result
+	  bank is released only after the complete packet enters the IIO kfifo.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called adi_starlink_pss_tracker.
+
+config ADI_STARLINK_PSS_MAP
+	tristate "Starlink PSS coarse phase-map transport"
+	depends on OF && HAS_IOMEM
+	select IIO_BUFFER
+	select IIO_KFIFO_BUF
+	help
+	  Native buffered IIO interface for the experimental FPGA PSS coarse
+	  phase maps. Each 20,000-bin map is transported as 200 independently
+	  identified chunks so libiio clients can reject incomplete reassembly.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called adi_starlink_pss_map.
+
 config ASPEED_ADC
 	tristate "Aspeed ADC"
 	depends on ARCH_ASPEED || COMPILE_TEST

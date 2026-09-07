@@ -189,6 +189,20 @@
 			adi,axi-decimation-core-available;
 		};
 
+		starlink_pss_track: pss-tracker@79030000 {
+			compatible = "adi,starlink-pss-tracker-1.00.a";
+			reg = <0x79030000 0x1000>;
+			interrupt-parent = <&intc>;
+			interrupts = <0 56 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		starlink_pss_map: pss-map@79040000 {
+			compatible = "adi,starlink-pss-map-1.00.a";
+			reg = <0x79040000 0x1000>;
+			interrupt-parent = <&intc>;
+			interrupts = <0 54 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
 		cf_ad9364_dac_core_0: cf-ad9361-dds-core-lpc@79024000 {
 			compatible = "adi,axi-ad9364-dds-6.00.a";
 			reg = <0x79024000 0x1000>;
