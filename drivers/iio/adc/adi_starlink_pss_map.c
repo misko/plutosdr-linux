@@ -4,12 +4,14 @@
  *
  * One hardware map is 20,000 u16 bins.  IIO scan_type.repeat is u8, so maps
  * are transported as 200 self-describing scans.  Each scan is one indivisible
- * array of 59 u32 words: nine metadata words followed by 100 packed u16 bins.
- * A single repeated channel avoids the full-array alignment gap that Linux IIO
- * inserts between separate repeated channels.  Generation, start index, chunk
- * ordinal, and first-bin metadata make reassembly and incomplete-map rejection
- * deterministic.  A hardware bank is released only after every chunk has
- * entered the IIO kfifo.
+ * array whose first 59 u32 words are nine metadata words followed by 100 packed
+ * u16 bins.  The transport scan is zero-padded to 64 words (256 bytes): Linux
+ * IIO aligns a repeated channel by its complete width using ALIGN(), so that
+ * width must be a power of two for kernel and libiio strides to agree.  A
+ * single padded channel also prevents partial scan masks.  Generation, start
+ * index, chunk ordinal, and first-bin metadata make reassembly and incomplete-
+ * map rejection deterministic.  A hardware bank is released only after every
+ * chunk has entered the IIO kfifo.
  */
 #include <linux/bitfield.h>
 #include <linux/iio/buffer.h>
@@ -79,7 +81,8 @@
 #define MAP_CHUNK_BINS                     100U
 #define MAP_CHUNKS                         (MAP_PHASE_BINS / MAP_CHUNK_BINS)
 #define MAP_META_WORDS                     9U
-#define MAP_CHUNK_WORDS                    (MAP_META_WORDS + MAP_CHUNK_BINS / 2U)
+#define MAP_CHUNK_PAYLOAD_WORDS            (MAP_META_WORDS + MAP_CHUNK_BINS / 2U)
+#define MAP_SCAN_WORDS                     64U
 
 #define MAP_STATUS_EPOCH_LIVE              BIT(0)
 #define MAP_STATUS_ENABLED                 BIT(1)
@@ -126,7 +129,7 @@ struct map_snapshot {
 };
 
 struct map_scan {
-	u32 words[MAP_CHUNK_WORDS];
+	u32 words[MAP_SCAN_WORDS];
 };
 
 struct adi_starlink_pss_map {
@@ -158,7 +161,7 @@ static const struct iio_chan_spec map_channels[] = {
 			.sign = 'u',
 			.realbits = 32,
 			.storagebits = 32,
-			.repeat = MAP_CHUNK_WORDS,
+			.repeat = MAP_SCAN_WORDS,
 			.endianness = IIO_LE,
 		},
 	},

@@ -52,6 +52,7 @@
 #define PSS_PACKET_MAGIC                   0x31535350U /* "PSS1" */
 #define PSS_PACKET_HEADER                  0x1a010001U
 #define PSS_RESULT_WORDS                   26U
+#define PSS_SCAN_WORDS                     32U
 #define PSS_MAX_COEFFICIENTS               264U
 #define PSS_COMMAND_FIFO_USABLE            7U
 
@@ -98,7 +99,13 @@ enum pss_attr {
 };
 
 struct pss_scan {
-	u32 words[PSS_RESULT_WORDS];
+	/*
+	 * Linux IIO aligns a repeated channel by its complete storage width,
+	 * using ALIGN(), whose alignment operand must be a power of two.  Keep
+	 * the 26-word FPGA packet intact and zero-pad its transport scan to 128
+	 * bytes so kernel and libiio calculate the same stride.
+	 */
+	u32 words[PSS_SCAN_WORDS];
 };
 
 struct adi_starlink_pss_tracker {
@@ -142,7 +149,7 @@ static const struct iio_chan_spec pss_channels[] = {
 			.sign = 'u',
 			.realbits = 32,
 			.storagebits = 32,
-			.repeat = PSS_RESULT_WORDS,
+			.repeat = PSS_SCAN_WORDS,
 			.endianness = IIO_LE,
 		},
 	},
