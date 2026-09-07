@@ -61,6 +61,8 @@
 		reg = <0x7C430000 0x10000>;
 		xlnx,num-ss-bits = <0x1>;
 		xlnx,spi-mode = <0>;
+		/* Absent from the dedicated 60 MS/s detector-only FPGA. */
+		status = "disabled";
 
 		spidev0: spidev@0 {
 			compatible = "adi,swspi";

@@ -118,6 +118,8 @@
 		axi_i2c0: i2c@41600000 {
 			compatible = "xlnx,axi-iic-1.02.a", "xlnx,xps-iic-2.00.a";
 			reg = <0x41600000 0x10000>;
+			/* Absent from the dedicated 60 MS/s detector-only FPGA. */
+			status = "disabled";
 			interrupt-parent = <&intc>;
 			interrupts = <0 59 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc 15>;
@@ -138,6 +140,8 @@
 		rx_dma: dma@7c400000 {
 			compatible = "adi,axi-dmac-1.00.a";
 			reg = <0x7c400000 0x1000>;
+			/* The detector-only FPGA processes RX in fabric and has no DMA. */
+			status = "disabled";
 			#dma-cells = <1>;
 			interrupts = <0 57 IRQ_TYPE_LEVEL_HIGH>;
 			clocks = <&clkc 16>;
@@ -181,8 +185,6 @@
 		cf_ad9364_adc_core_0: cf-ad9361-lpc@79020000 {
 			compatible = "adi,axi-ad9361-6.00.a";
 			reg = <0x79020000 0x6000>;
-			dmas = <&rx_dma 0>;
-			dma-names = "rx";
 			spibus-connected = <&adc0_ad9364>;
 			adi,axi-decimation-core-available;
 		};
