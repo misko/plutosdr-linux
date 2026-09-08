@@ -38,6 +38,7 @@ obj-$(CONFIG_AD799X) += ad799x.o
 obj-$(CONFIG_ADI_AXI_ADC) += adi-axi-adc.o
 obj-$(CONFIG_ADI_STARLINK_PSS_TRACKER) += adi_starlink_pss_tracker.o
 obj-$(CONFIG_ADI_STARLINK_PSS_MAP) += adi_starlink_pss_map.o
+obj-$(CONFIG_ADI_STARLINK_PILOT) += adi_starlink_pilot.o
 obj-$(CONFIG_ADI_TANDEM_AGC) += adi_tandem_agc.o
 obj-$(CONFIG_AD9963) += ad9963.o
 obj-$(CONFIG_ADAQ8092) += adaq8092.o

@@ -430,6 +430,16 @@ config ADI_STARLINK_PSS_MAP
 	  To compile this driver as a module, choose M here: the module will be
 	  called adi_starlink_pss_map.
 
+config ADI_STARLINK_PILOT
+	tristate "Starlink paired 2.5 MS/s pilot capture (experimental)"
+	depends on OF && HAS_IOMEM && DMA_ENGINE && COMMON_CLK
+	select IIO_BUFFER
+	select IIO_BUFFER_DMAENGINE
+	help
+	  Single-RX CI16 capture after FPGA pilot filtering/decimation, with a
+	  distinct PIL1 counter snapshot ABI. Requires the opt-in paired-pilot
+	  FPGA profile and device tree. Does not enable TX or the raw RX DMA.
+
 config ASPEED_ADC
 	tristate "Aspeed ADC"
 	depends on ARCH_ASPEED || COMPILE_TEST

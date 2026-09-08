@@ -1,0 +1,68 @@
+What:           /sys/bus/iio/devices/iio:deviceX/capture_abi
+Date:           September 2026
+Contact:        PlutoSDR experimental receiver contributors
+Description:
+                PIL1-1.0-upper-only identifies experimental post-decimation
+                single-RX CI16 pilot capture. It is not the production dual-RX
+                equal-rate metadata ABI. sampling_frequency is read-only
+                2500000; the PHY remains at its separate full source rate.
+
+What:           /sys/bus/iio/devices/iio:deviceX/capture_visit_id
+What:           /sys/bus/iio/devices/iio:deviceX/capture_sample_limit
+Date:           September 2026
+Contact:        PlutoSDR experimental receiver contributors
+Description:
+                Unsigned decimal u32 configuration, writable only with buffers
+                disabled. A nonzero visit ID must be explicitly set before
+                enabling capture. Limit 0 means continuous. A positive limit
+                must be a multiple of the requested IIO buffer length and
+                stops after exactly that many supported complex output samples.
+                Both I and Q must be enabled; driver refuses partial scan masks.
+                Full source clock rate must match the FPGA rate at enable.
+
+What:           /sys/bus/iio/devices/iio:deviceX/capture_fault
+Date:           September 2026
+Contact:        PlutoSDR experimental receiver contributors
+Description:
+                Live capture fault bitmask, eight hexadecimal digits. Faults
+                stop FPGA admission, not the already offered DMA prefix. This
+                initial driver polls status; it does not enable the fault IRQ.
+                Readers must check snapshots/faults and use bounded IIO waits.
+
+What:           /sys/bus/iio/devices/iio:deviceX/capture_snapshot
+Date:           September 2026
+Contact:        PlutoSDR experimental receiver contributors
+Description:
+                One atomic hardware snapshot per sysfs read, serialized with
+                capture control. ASCII whitespace-separated fields:
+                PIL1 00010000 source_hz 2500000 generation recovery_failed
+                actual_source_hz dma_error word0 ... word25
+                Header numeric fields after version are decimal (dma_error
+                is a signed kernel errno); each word is eight hexadecimal digits.
+                Hardware words are latched together; actual clock/DMA error
+                are contemporaneous software observations, not latched RF state.
+                Word pairs are low/high unsigned 64-bit values:
+                  0..1   first admitted newest canonical index
+                  2..3   last admitted newest canonical index
+                  4..5   admitted count
+                  6..7   AXIS-delivered count
+                  8..9   unsupported count
+                  10..11 first fault diagnostic coordinate
+                  12..13 DDC accepted count
+                  14..15 DDC emitted count
+                  16     DDC saturation count
+                  17     DDC sticky faults [7:0], ingress high water [15:8]
+                  18     capture faults
+                  19     status: active/queued/fault/prefix/used bits 0..4
+                  20     visit ID
+                  21     output FIFO high water
+                  22     output FIFO queued count
+                  23..25 reserved zero
+                Output sample j has original-source signal-center coordinate
+                (first_index + 6*j - 269) * (source_hz / 15000000).
+                No per-sample metadata is interleaved into the CI16 buffer.
+                AXIS delivery does NOT prove DDR, host, or disk completion.
+                Cancellation stops admission and drains before DMA abort. A
+                bounded drain failure sets recovery_failed and refuses re-arm;
+                it must be surfaced, never concealed by clearing buffered IQ.
+                Hardware/DMA fault recovery remains a qualification gate.

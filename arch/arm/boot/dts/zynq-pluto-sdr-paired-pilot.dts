@@ -1,0 +1,31 @@
+// SPDX-License-Identifier: GPL-2.0
+/* Opt-in ONLY: requires the paired-pilot FPGA. Not a production scanner ABI. */
+#include "zynq-pluto-sdr-revc.dts"
+
+&rx_dma {
+	status = "okay";
+	adi,channels {
+		dma-channel@0 {
+			adi,source-bus-width = <32>;
+			adi,source-bus-type = <1>;
+		};
+	};
+};
+
+&fpga_axi {
+	starlink_pilot: pilot-capture@79050000 {
+		compatible = "adi,starlink-pilot-capture-1.00.a";
+		reg = <0x79050000 0x1000>;
+		interrupt-parent = <&intc>;
+		interrupts = <0 55 IRQ_TYPE_LEVEL_HIGH>;
+		dmas = <&rx_dma 0>;
+		dma-names = "rx";
+		/* AD9361 clock-provider enum: RX_SAMPL_CLK = 8, not TX = 13. */
+		clocks = <&adc0_ad9364 8>;
+		clock-names = "rx_sample";
+	};
+};
+
+/ {
+	model = "Experimental PlutoSDR paired pilot/PSS receiver — DO NOT MERGE";
+};
