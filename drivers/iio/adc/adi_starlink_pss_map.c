@@ -74,7 +74,7 @@
 
 #define MAP_IDENTIFICATION                 0x50534d41U /* "PSMA" */
 #define MAP_MIN_VERSION                    0x00010001U
-#define MAP_MAX_VERSION                    0x00010004U
+#define MAP_MAX_VERSION                    0x00010005U
 #define MAP_PHASE_BINS                     20000U
 #define MAP_TILE_GEOMETRY                  0x00401002U
 #define MAP_CHUNK_MAGIC                    0x4b4e4843U /* "CHNK" */
@@ -254,6 +254,13 @@ static bool map_snapshot_fault_free(struct adi_starlink_pss_map *st,
 {
 	u32 health_mask = st->version == MAP_MIN_VERSION ? 0x17ffU : 0x37ffU;
 	unsigned int index;
+
+	/* ABI 1.5 is canonical 15 MS/s with one shared transform service.
+	 * Preserve all legacy fatal bits and additionally reject service bit 14;
+	 * do not reinterpret the dedicated forward/inverse diagnostics.
+	 */
+	if (st->version == 0x00010005U)
+		health_mask = 0x57ffU;
 
 	for (index = 0; index < ARRAY_SIZE(snapshot->fault_signature); index++) {
 		if (index == 7) {
@@ -663,6 +670,15 @@ static int map_require_contract(struct adi_starlink_pss_map *st)
 		delay = 21;
 		energy = 1073765335U;
 		contract = contract_60;
+		break;
+	case 0x00010005U:
+		/* Explicit opt-in image identity; never a 30/60 MS/s contract. */
+		st->input_rate_msps = 15;
+		expected_capabilities = 0x0000013fU;
+		if (map_read(st, MAP_REG_INPUT_RATE_MSPS) != 15U ||
+		    map_read(st, MAP_REG_DDC_CONFIG) != 0x000f0202U ||
+		    map_read(st, MAP_REG_DDC_GROUP_DELAY) != 0U)
+			return -EINVAL;
 		break;
 	default:
 		return -EINVAL;
