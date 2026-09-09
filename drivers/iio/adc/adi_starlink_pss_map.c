@@ -82,10 +82,20 @@
 #define MAP_REG_DDC_SATURATION              0xec
 #define MAP_REG_DDC_ACCEPTED_HI             0xf0
 #define MAP_REG_DDC_EMITTED_HI              0xf4
+#define MAP_REG_STOP_TICKET                 0xf8
+#define MAP_REG_STOP_WORD                   0xfc
 
 #define MAP_IDENTIFICATION                 0x50534d41U /* "PSMA" */
 #define MAP_MIN_VERSION                    0x00010001U
-#define MAP_MAX_VERSION                    0x00010005U
+#define MAP_MAX_VERSION                    0x00010006U
+#define MAP_STOP_VERSION                   0x00010006U
+#define MAP_STOP_CAPABILITIES              0x0000033fU
+#define MAP_STOP_MAGIC                     0x50535354U
+#define MAP_STOP_VERSION_WORDS             0x0001000cU
+#define MAP_STOP_WORDS                     12U
+#define MAP_STOP_FLAGS_MASK                0x0000003fU
+#define MAP_STOP_REASONS_MASK              0x0000003fU
+#define MAP_STOP_ENABLED                   BIT(5)
 #define MAP_PHASE_BINS                     20000U
 #define MAP_TILE_GEOMETRY                  0x00401002U
 #define MAP_CHUNK_MAGIC                    0x4b4e4843U /* "CHNK" */
@@ -421,11 +431,11 @@ static bool map_snapshot_fault_free(struct adi_starlink_pss_map *st,
 	u32 health_mask = st->version == MAP_MIN_VERSION ? 0x17ffU : 0x37ffU;
 	unsigned int index;
 
-	/* ABI 1.5 is canonical 15 MS/s with one shared transform service.
+	/* ABI 1.5/1.6 are canonical 15 MS/s with one shared transform service.
 	 * Preserve all legacy fatal bits and additionally reject service bit 14;
 	 * do not reinterpret the dedicated forward/inverse diagnostics.
 	 */
-	if (st->version == 0x00010005U)
+	if (st->version == 0x00010005U || st->version == MAP_STOP_VERSION)
 		health_mask = 0x57ffU;
 
 	for (index = 0; index < ARRAY_SIZE(snapshot->fault_signature); index++) {
@@ -437,6 +447,185 @@ static bool map_snapshot_fault_free(struct adi_starlink_pss_map *st,
 		}
 	}
 	return true;
+}
+
+static int map_require_stop(struct adi_starlink_pss_map *st)
+{
+	if (st->version != MAP_STOP_VERSION)
+		return -EOPNOTSUPP;
+	if (st->input_rate_msps != 15U ||
+	    map_read(st, MAP_REG_ID) != MAP_IDENTIFICATION ||
+	    map_read(st, MAP_REG_VERSION) != MAP_STOP_VERSION ||
+	    map_read(st, MAP_REG_CAPABILITIES) != MAP_STOP_CAPABILITIES ||
+	    map_read(st, MAP_REG_PHASE_BINS) != MAP_PHASE_BINS ||
+	    map_read(st, MAP_REG_TILE_GEOMETRY) != MAP_TILE_GEOMETRY ||
+	    map_read(st, MAP_REG_INPUT_RATE_MSPS) != 15U ||
+	    map_read(st, MAP_REG_DDC_CONFIG) != 0x000f0202U ||
+	    map_read(st, MAP_REG_DDC_GROUP_DELAY) != 0U)
+		return -ENODEV;
+	return 0;
+}
+
+/* Caller holds st->lock, shared with IRQ bank copying. Selector writes are
+ * side-effect-free except for the selected word; never use auto-increment.
+ */
+static u32 map_read_stop_word(struct adi_starlink_pss_map *st, u32 selector)
+{
+	map_write(st, MAP_REG_STOP_WORD, selector);
+	return map_read(st, MAP_REG_STOP_WORD);
+}
+
+static int map_take_stop(struct adi_starlink_pss_map *st,
+			 u32 words[MAP_STOP_WORDS])
+{
+	static const u32 bracket[] = { 2U, 3U, 4U, 10U, 11U };
+	u32 before[ARRAY_SIZE(bracket)], after[ARRAY_SIZE(bracket)];
+	u32 status_before, status_after, ticket_before, ticket_after;
+	unsigned int attempt, index;
+	int ret;
+
+	ret = map_require_stop(st);
+	if (ret)
+		return ret;
+	for (attempt = 0; attempt < 3; attempt++) {
+		status_before = map_read(st, MAP_REG_STATUS);
+		ticket_before = map_read(st, MAP_REG_STOP_TICKET);
+		for (index = 0; index < ARRAY_SIZE(bracket); index++)
+			before[index] = map_read_stop_word(st, bracket[index]);
+		for (index = 0; index < MAP_STOP_WORDS; index++)
+			words[index] = map_read_stop_word(st, index);
+		for (index = 0; index < ARRAY_SIZE(bracket); index++)
+			after[index] = map_read_stop_word(st, bracket[index]);
+		ticket_after = map_read(st, MAP_REG_STOP_TICKET);
+		status_after = map_read(st, MAP_REG_STATUS);
+		if (memcmp(before, after, sizeof(before)) ||
+		    ticket_before != ticket_after || words[3] != ticket_after ||
+		    ((status_before ^ status_after) &
+		     (MAP_STATUS_EPOCH_LIVE | MAP_STATUS_ENABLED)))
+			continue;
+		for (index = 0; index < ARRAY_SIZE(bracket); index++)
+			if (words[bracket[index]] != after[index])
+				break;
+		if (index != ARRAY_SIZE(bracket))
+			continue;
+		ret = map_require_stop(st);
+		if (ret)
+			return ret;
+		if (!(status_after & MAP_STATUS_EPOCH_LIVE))
+			return -ENODEV;
+		if (words[0] != MAP_STOP_MAGIC ||
+		    words[1] != MAP_STOP_VERSION_WORDS ||
+		    (words[2] & ~MAP_STOP_FLAGS_MASK) ||
+		    (words[10] & ~MAP_STOP_REASONS_MASK) || words[11] > 5U)
+			return -EPROTO;
+		if (!!(words[2] & MAP_STOP_ENABLED) !=
+		    !!(status_after & MAP_STATUS_ENABLED))
+			continue;
+		/* Refresh only the cache. Success never disables IRQ, streaming,
+		 * the pilot path or buffers. Failed/historical tuples are returned
+		 * verbatim, not upgraded to structural/health/delivery success.
+		 */
+		st->acquisition_enabled = !!(status_after & MAP_STATUS_ENABLED);
+		return 0;
+	}
+	return -EAGAIN;
+}
+
+static ssize_t map_acquisition_stop_show(struct device *dev,
+					struct device_attribute *attr, char *buf)
+{
+	struct adi_starlink_pss_map *st = iio_priv(dev_to_iio_dev(dev));
+	u32 words[MAP_STOP_WORDS];
+	unsigned int index;
+	int ret, length;
+
+	mutex_lock(&st->lock);
+	ret = map_take_stop(st, words);
+	mutex_unlock(&st->lock);
+	if (ret)
+		return ret;
+	length = sysfs_emit(buf, "PSST 1 %u", MAP_STOP_WORDS);
+	for (index = 0; index < MAP_STOP_WORDS; index++)
+		length += sysfs_emit_at(buf, length, " %08x", words[index]);
+	return length + sysfs_emit_at(buf, length, "\n");
+}
+
+static int map_stop_command_error(u32 command)
+{
+	switch (command) {
+	case 0: return 0;
+	case 1: return -EINVAL;
+	case 2: return -ERANGE;
+	case 3: return -EBUSY;
+	case 4: return -EPIPE;
+	case 5: return -EIO;
+	default: return -EPROTO;
+	}
+}
+
+static int map_request_stop(struct adi_starlink_pss_map *st, u32 ticket)
+{
+	u32 words[MAP_STOP_WORDS], accepted;
+	int ret, poll_ret;
+
+	if (!ticket)
+		return -EINVAL;
+	ret = map_take_stop(st, words);
+	if (ret)
+		return ret;
+	if (!st->streaming || !st->irq_live)
+		return -EBUSY;
+	/* A repeated accepted ticket remains queryable after stop, including
+	 * a lost response. It cannot arm another stop after a restart.
+	 */
+	if (ticket != words[3]) {
+		if (st->fault_flags)
+			return -EIO;
+		if (!st->acquisition_enabled)
+			return -EPIPE;
+		if (words[3] == U32_MAX)
+			return -EOVERFLOW;
+		if (ticket != words[3] + 1U)
+			return -ERANGE;
+	}
+	map_write(st, MAP_REG_STOP_TICKET, ticket);
+	/* This is only the bounded engine-acceptance phase, never a tile wait.
+	 * Hardware performs the same-edge admission/health fence. A staged
+	 * request may fail before acceptance; rejected status ends the poll.
+	 */
+	poll_ret = readl_poll_timeout(st->regs + MAP_REG_STOP_TICKET, accepted,
+		accepted == ticket || map_read_stop_word(st, 11U) != 0U,
+		1, 10000);
+	ret = map_take_stop(st, words);
+	if (ret)
+		return ret;
+	ret = map_stop_command_error(words[11]);
+	if (ret)
+		return ret;
+	if (poll_ret)
+		return poll_ret;
+	if (words[3] != ticket)
+		return -EIO;
+	return 0;
+}
+
+static ssize_t map_acquisition_stop_request_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t len)
+{
+	struct adi_starlink_pss_map *st = iio_priv(dev_to_iio_dev(dev));
+	u32 ticket;
+	int ret;
+
+	ret = kstrtou32(buf, 0, &ticket);
+	if (ret)
+		return ret;
+	mutex_lock(&st->lock);
+	ret = map_request_stop(st, ticket);
+	mutex_unlock(&st->lock);
+	if (ret)
+		return ret;
+	return len;
 }
 
 static unsigned int map_choose_bank(const struct map_snapshot *snapshot)
@@ -765,6 +954,10 @@ static MAP_ATTR_RO(fault_flags, MAP_ATTR_FAULT_FLAGS);
 static MAP_ATTR_WO(fault_clear, MAP_ATTR_FAULT_CLEAR);
 static IIO_DEVICE_ATTR(acquisition_health, 0444, map_acquisition_health_show,
 		       NULL, 0);
+static IIO_DEVICE_ATTR(acquisition_stop, 0444, map_acquisition_stop_show,
+		       NULL, 0);
+static IIO_DEVICE_ATTR(acquisition_stop_request, 0200, NULL,
+		       map_acquisition_stop_request_store, 0);
 
 static struct attribute *map_attrs[] = {
 	&iio_dev_attr_fpga_identity.dev_attr.attr,
@@ -785,6 +978,8 @@ static struct attribute *map_attrs[] = {
 	&iio_dev_attr_fault_flags.dev_attr.attr,
 	&iio_dev_attr_fault_clear.dev_attr.attr,
 	&iio_dev_attr_acquisition_health.dev_attr.attr,
+	&iio_dev_attr_acquisition_stop.dev_attr.attr,
+	&iio_dev_attr_acquisition_stop_request.dev_attr.attr,
 	NULL,
 };
 
@@ -841,9 +1036,11 @@ static int map_require_contract(struct adi_starlink_pss_map *st)
 		contract = contract_60;
 		break;
 	case 0x00010005U:
+	case MAP_STOP_VERSION:
 		/* Explicit opt-in image identity; never a 30/60 MS/s contract. */
 		st->input_rate_msps = 15;
-		expected_capabilities = 0x0000013fU;
+		expected_capabilities = st->version == MAP_STOP_VERSION ?
+			MAP_STOP_CAPABILITIES : 0x0000013fU;
 		if (map_read(st, MAP_REG_INPUT_RATE_MSPS) != 15U ||
 		    map_read(st, MAP_REG_DDC_CONFIG) != 0x000f0202U ||
 		    map_read(st, MAP_REG_DDC_GROUP_DELAY) != 0U)
