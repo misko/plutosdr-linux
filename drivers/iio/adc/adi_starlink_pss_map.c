@@ -49,8 +49,10 @@
 #define MAP_REG_SNAPSHOT_START_0_HI        0x4c
 #define MAP_REG_SNAPSHOT_START_1_LO        0x50
 #define MAP_REG_SNAPSHOT_START_1_HI        0x54
+#define MAP_REG_SNAPSHOT_ACCEPTED          0x58
 #define MAP_REG_SNAPSHOT_DISCARDED         0x5c
 #define MAP_REG_SNAPSHOT_DISCONTINUITY     0x60
+#define MAP_REG_SNAPSHOT_PUBLISHED         0x64
 #define MAP_REG_SNAPSHOT_OVERRUN           0x68
 #define MAP_REG_SNAPSHOT_PROTOCOL_ERROR    0x6c
 #define MAP_REG_SNAPSHOT_ARITH_OVERFLOW    0x70
@@ -61,16 +63,25 @@
 #define MAP_REG_SNAPSHOT_REQUEST_OVERRUN   0x84
 #define MAP_REG_SNAPSHOT_HEALTH_FLAGS      0x88
 #define MAP_REG_SNAPSHOT_INGRESS_DROPPED   0x8c
+#define MAP_REG_SNAPSHOT_INGRESS_FIFO      0x90
 #define MAP_REG_SNAPSHOT_SCHEDULER_GAP     0x94
 #define MAP_REG_SNAPSHOT_SCHEDULER_INDEX   0x98
 #define MAP_REG_SNAPSHOT_SCHEDULER_OVERFLOW 0x9c
 #define MAP_REG_SNAPSHOT_DETECTOR_FAULT    0xa0
 #define MAP_REG_SNAPSHOT_PHASE_DISCONTINUITY 0xa4
+#define MAP_REG_SNAPSHOT_DENOMINATOR_ZERO  0xa8
+#define MAP_REG_SNAPSHOT_CANDIDATE_FIFO    0xac
 #define MAP_REG_INPUT_RATE_MSPS            0xb0
 #define MAP_REG_DDC_CONFIG                 0xb4
 #define MAP_REG_DDC_GROUP_DELAY            0xb8
 #define MAP_REG_COEFFICIENT_ENERGY         0xbc
 #define MAP_REG_DDC_CONTRACT_0             0xc0
+#define MAP_REG_DDC_ACCEPTED_LO             0xe0
+#define MAP_REG_DDC_EMITTED_LO              0xe4
+#define MAP_REG_DDC_DISCONTINUITY           0xe8
+#define MAP_REG_DDC_SATURATION              0xec
+#define MAP_REG_DDC_ACCEPTED_HI             0xf0
+#define MAP_REG_DDC_EMITTED_HI              0xf4
 
 #define MAP_IDENTIFICATION                 0x50534d41U /* "PSMA" */
 #define MAP_MIN_VERSION                    0x00010001U
@@ -83,6 +94,7 @@
 #define MAP_META_WORDS                     9U
 #define MAP_CHUNK_PAYLOAD_WORDS            (MAP_META_WORDS + MAP_CHUNK_BINS / 2U)
 #define MAP_SCAN_WORDS                     64U
+#define MAP_HEALTH_WORDS                   46U
 
 #define MAP_STATUS_EPOCH_LIVE              BIT(0)
 #define MAP_STATUS_ENABLED                 BIT(1)
@@ -126,6 +138,11 @@ struct map_snapshot {
 	u32 map_generation[2];
 	u64 start_index[2];
 	u32 fault_signature[14];
+	u32 accepted;
+	u32 published;
+	u32 denominator_zero;
+	u32 ingress_fifo;
+	u32 candidate_fifo;
 };
 
 struct map_scan {
@@ -227,6 +244,9 @@ static int map_take_snapshot(struct adi_starlink_pss_map *st,
 		return ret;
 
 	snapshot->generation = map_read(st, MAP_REG_SNAPSHOT_GENERATION);
+	/* Do not accept another request completed between poll and payload. */
+	if (snapshot->generation != before + 1U)
+		return -EIO;
 	snapshot->ready_mask = map_read(st, MAP_REG_SNAPSHOT_READY) & 0x3U;
 	snapshot->map_generation[0] =
 		map_read(st, MAP_REG_SNAPSHOT_MAP_GENERATION_0);
@@ -241,12 +261,158 @@ static int map_take_snapshot(struct adi_starlink_pss_map *st,
 	for (index = 0; index < ARRAY_SIZE(fault_registers); index++)
 		snapshot->fault_signature[index] =
 			map_read(st, fault_registers[index]);
+	snapshot->accepted = map_read(st, MAP_REG_SNAPSHOT_ACCEPTED);
+	snapshot->published = map_read(st, MAP_REG_SNAPSHOT_PUBLISHED);
+	snapshot->denominator_zero =
+		map_read(st, MAP_REG_SNAPSHOT_DENOMINATOR_ZERO);
+	snapshot->ingress_fifo = map_read(st, MAP_REG_SNAPSHOT_INGRESS_FIFO);
+	snapshot->candidate_fifo = map_read(st, MAP_REG_SNAPSHOT_CANDIDATE_FIFO);
 	overrun_after = map_read(st, MAP_REG_SNAPSHOT_REQUEST_OVERRUN);
 	if (overrun_after != overrun_before ||
 	    (map_read(st, MAP_REG_SNAPSHOT_STATUS) & 0x3U) != 1U ||
 	    map_read(st, MAP_REG_SNAPSHOT_GENERATION) != snapshot->generation)
 		return -EIO;
 	return 0;
+}
+
+static int map_read_live_ddc64(struct adi_starlink_pss_map *st,
+			       unsigned int low_reg, unsigned int high_reg,
+			       u32 *low, u32 *high)
+{
+	unsigned int attempt;
+	u32 before;
+
+	/* These registers are live, NOT in the coherent map snapshot payload.
+	 * Avoid a torn individual counter at rollover. This does not make the
+	 * accepted/emitted pair, or either counter and the snapshot, atomic.
+	 */
+	for (attempt = 0; attempt < 3; attempt++) {
+		before = map_read(st, high_reg);
+		*low = map_read(st, low_reg);
+		*high = map_read(st, high_reg);
+		if (before == *high)
+			return 0;
+	}
+	return -EAGAIN;
+}
+
+/* acquisition_health v1: "PSMH 1 46" and 46 fixed-width hex u32 words.
+ *
+ *  0 ABI; 1 declared (not measured PHY) input MSPS; 2 snapshot generation;
+ *  3/4 live status before/after; 5 driver streaming/enabled/IRQ bits 0/1/2;
+ *  6 driver faults; 7/8/9 maps/chunks/push failures (existing u32 counters);
+ * 10 snapshot ready; 11/12 map generations; 13..16 start0/start1 LO,HI;
+ * 17..30 complete coherent fault_signature in map_take_snapshot() order;
+ * 31/32 live bridge read/release errors; 33 live snapshot-request overruns;
+ * 34 DDC mode: 0 absent, 1 live low32, 2 live individually sampled64;
+ * 35..38 live DDC accepted/emitted LO,HI; 39/40 discontinuity/saturation;
+ * 41..45 coherent accepted/published/denominator-zero/ingress/candidate FIFO.
+ * FIFO words contain current level in low16, maximum level in high16.
+ *
+ * Only words 2, 10..30 and 41..45 are one hardware snapshot. The st->lock
+ * mutex serializes driver lifecycle and delivery fields with map_irq_thread.
+ * No fault, bank, acquisition or IRQ state is changed by taking this receipt.
+ * Even with no ready map it requests fresh health, exposing a late fault.
+ * A successful read reports faults; it is not itself a fault-free verdict.
+ */
+static int map_take_health(struct adi_starlink_pss_map *st,
+			   u32 words[MAP_HEALTH_WORDS])
+{
+	struct map_snapshot snapshot;
+	unsigned int index;
+	u32 overrun_before;
+	int ret;
+
+	if (map_read(st, MAP_REG_ID) != MAP_IDENTIFICATION ||
+	    map_read(st, MAP_REG_VERSION) != st->version)
+		return -ENODEV;
+	/* ABI 1.1 predates the input-rate register; its admitted rate is 15. */
+	if (st->version != MAP_MIN_VERSION &&
+	    map_read(st, MAP_REG_INPUT_RATE_MSPS) != st->input_rate_msps)
+		return -ENODEV;
+	memset(words, 0, sizeof(u32) * MAP_HEALTH_WORDS);
+	words[0] = st->version;
+	words[1] = st->input_rate_msps;
+	words[3] = map_read(st, MAP_REG_STATUS);
+	overrun_before = map_read(st, MAP_REG_SNAPSHOT_REQUEST_OVERRUN);
+	ret = map_take_snapshot(st, &snapshot);
+	if (ret)
+		return ret;
+	words[2] = snapshot.generation;
+	words[5] = (st->streaming ? BIT(0) : 0) |
+		(st->acquisition_enabled ? BIT(1) : 0) |
+		(st->irq_live ? BIT(2) : 0);
+	words[6] = st->fault_flags;
+	words[7] = st->maps_delivered;
+	words[8] = st->chunks_delivered;
+	words[9] = st->buffer_push_failures;
+	words[10] = snapshot.ready_mask;
+	words[11] = snapshot.map_generation[0];
+	words[12] = snapshot.map_generation[1];
+	words[13] = lower_32_bits(snapshot.start_index[0]);
+	words[14] = upper_32_bits(snapshot.start_index[0]);
+	words[15] = lower_32_bits(snapshot.start_index[1]);
+	words[16] = upper_32_bits(snapshot.start_index[1]);
+	for (index = 0; index < ARRAY_SIZE(snapshot.fault_signature); index++)
+		words[17 + index] = snapshot.fault_signature[index];
+	words[31] = map_read(st, MAP_REG_BRIDGE_READ_ERROR);
+	words[32] = map_read(st, MAP_REG_BRIDGE_RELEASE_ERROR);
+	if (st->input_rate_msps != 15) {
+		/* Only ABI 1.4 exposes high words. Paired 30 MS/s may count
+		 * internally in 64 bits, but its frozen ABI remains low32.
+		 */
+		words[34] = st->version == 0x00010004U ? 2U : 1U;
+		if (words[34] == 2U) {
+			ret = map_read_live_ddc64(st, MAP_REG_DDC_ACCEPTED_LO,
+					MAP_REG_DDC_ACCEPTED_HI,
+					&words[35], &words[36]);
+			if (ret)
+				return ret;
+			ret = map_read_live_ddc64(st, MAP_REG_DDC_EMITTED_LO,
+					MAP_REG_DDC_EMITTED_HI,
+					&words[37], &words[38]);
+			if (ret)
+				return ret;
+		} else {
+			words[35] = map_read(st, MAP_REG_DDC_ACCEPTED_LO);
+			words[37] = map_read(st, MAP_REG_DDC_EMITTED_LO);
+		}
+		words[39] = map_read(st, MAP_REG_DDC_DISCONTINUITY);
+		words[40] = map_read(st, MAP_REG_DDC_SATURATION);
+	}
+	words[41] = snapshot.accepted;
+	words[42] = snapshot.published;
+	words[43] = snapshot.denominator_zero;
+	words[44] = snapshot.ingress_fifo;
+	words[45] = snapshot.candidate_fifo;
+	words[4] = map_read(st, MAP_REG_STATUS);
+	words[33] = map_read(st, MAP_REG_SNAPSHOT_REQUEST_OVERRUN);
+	if (words[33] != overrun_before ||
+	    (map_read(st, MAP_REG_SNAPSHOT_STATUS) & 3U) != 1U ||
+	    map_read(st, MAP_REG_SNAPSHOT_GENERATION) != snapshot.generation)
+		return -EIO;
+	return 0;
+}
+
+static ssize_t map_acquisition_health_show(struct device *dev,
+					  struct device_attribute *attr,
+					  char *buf)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct adi_starlink_pss_map *st = iio_priv(indio_dev);
+	u32 words[MAP_HEALTH_WORDS];
+	unsigned int index;
+	int ret, length;
+
+	mutex_lock(&st->lock);
+	ret = map_take_health(st, words);
+	mutex_unlock(&st->lock);
+	if (ret)
+		return ret;
+	length = sysfs_emit(buf, "PSMH 1 %u", MAP_HEALTH_WORDS);
+	for (index = 0; index < MAP_HEALTH_WORDS; index++)
+		length += sysfs_emit_at(buf, length, " %08x", words[index]);
+	return length + sysfs_emit_at(buf, length, "\n");
 }
 
 static bool map_snapshot_fault_free(struct adi_starlink_pss_map *st,
@@ -597,6 +763,8 @@ static MAP_ATTR_RO(buffer_push_failures, MAP_ATTR_BUFFER_PUSH_FAILURES);
 static MAP_ATTR_RO(reassembly_chunks, MAP_ATTR_REASSEMBLY_CHUNKS);
 static MAP_ATTR_RO(fault_flags, MAP_ATTR_FAULT_FLAGS);
 static MAP_ATTR_WO(fault_clear, MAP_ATTR_FAULT_CLEAR);
+static IIO_DEVICE_ATTR(acquisition_health, 0444, map_acquisition_health_show,
+		       NULL, 0);
 
 static struct attribute *map_attrs[] = {
 	&iio_dev_attr_fpga_identity.dev_attr.attr,
@@ -616,6 +784,7 @@ static struct attribute *map_attrs[] = {
 	&iio_dev_attr_reassembly_chunks.dev_attr.attr,
 	&iio_dev_attr_fault_flags.dev_attr.attr,
 	&iio_dev_attr_fault_clear.dev_attr.attr,
+	&iio_dev_attr_acquisition_health.dev_attr.attr,
 	NULL,
 };
 
