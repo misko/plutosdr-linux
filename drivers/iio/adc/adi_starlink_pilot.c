@@ -34,6 +34,15 @@
 #define PIL_CLEAR 4
 #define PIL_LATCH 8
 #define PIL_WORDS 26
+/* PIL1's fixed block design is CI16 AXIS -> 64-bit memory, not raw RX DMA. */
+#define PIL_SCAN_BYTES 4
+#define PIL_DMA_ALIGNMENT 8
+/*
+ * 24-bit X_LENGTH stores bytes - 1: one PIL1 descriptor is at most 16 MiB.
+ * The AXI DMA driver can split larger transfers and advertises UINT_MAX to
+ * DMAengine; this is our conservative PIL1 bound, not that advertised cap.
+ */
+#define PIL_DMA_MAX_BYTES BIT(24)
 
 struct pilot_state {
 	void __iomem *regs;
@@ -42,6 +51,7 @@ struct pilot_state {
 	u32 visit;
 	u32 limit;
 	u32 source_rate;
+	u32 buffer_bytes;
 	int dma_error;
 	u32 dma_submitted;
 	bool recovery_failed;
@@ -189,18 +199,52 @@ static const struct iio_chan_spec pilot_channels[] = {
 };
 static const unsigned long pilot_scan_masks[] = { BIT(0) | BIT(1), 0 };
 
+static int pilot_buffer_geometry(struct pilot_state *st, unsigned int length)
+{
+	u64 bytes = (u64)length * PIL_SCAN_BYTES;
+
+	/*
+	 * The DMAengine helper rounds down to its bus-width alignment. Reject
+	 * that truncation before ARM, including odd CI16 buffer lengths. The
+	 * finite source must fill whole, equal-sized submitted descriptors.
+	 */
+	if (!bytes || bytes > PIL_DMA_MAX_BYTES || bytes % PIL_DMA_ALIGNMENT ||
+	    (st->limit && st->limit % length))
+		return -EINVAL;
+	st->buffer_bytes = bytes;
+	return 0;
+}
+
 static int pilot_submit(struct iio_dma_buffer_queue *queue,
 			struct iio_dma_buffer_block *block)
 {
 	struct pilot_state *st = queue->driver_data;
 	int ret;
 
-	/* Direction is explicitly capture, not the generic ADC's TX helper. */
-	ret = iio_dmaengine_buffer_submit_block(queue, block, DMA_DEV_TO_MEM);
+	/*
+	 * mmap/block allocation can differ from buffer/length. Validate the
+	 * actual descriptor too; a shorter final DMA block is not implied by
+	 * the FPGA sample limit. PIL1 never permits cyclic capture descriptors.
+	 */
+	if (!st->buffer_bytes || block->block.size != st->buffer_bytes ||
+	    block->block.flags & IIO_BUFFER_BLOCK_FLAG_CYCLIC)
+		ret = -EINVAL;
+	else
+		/* Direction is capture, not the generic ADC's TX helper. */
+		ret = iio_dmaengine_buffer_submit_block(queue, block, DMA_DEV_TO_MEM);
 	if (ret)
 		WRITE_ONCE(st->dma_error, ret);
-	else if (st->dma_submitted != U32_MAX)
-		st->dma_submitted++;
+	else {
+		/*
+		 * The helper may cap/round an otherwise accepted DMA request. Its
+		 * success transfers block ownership: retain return 0 so the IIO
+		 * core does not release an in-flight block, but prevent ARM below.
+		 */
+		if (block->block.bytes_used != st->buffer_bytes)
+			WRITE_ONCE(st->dma_error, -EMSGSIZE);
+		if (st->dma_submitted != U32_MAX)
+			st->dma_submitted++;
+	}
 	return ret;
 }
 
@@ -224,12 +268,9 @@ static int pilot_preenable(struct iio_dev *indio)
 		ret = -EINVAL;
 		goto out;
 	}
-	/* Finite captures must complete whole requested IIO buffers. */
-	if (st->limit && (!indio->buffer->length ||
-	    st->limit % indio->buffer->length)) {
-		ret = -EINVAL;
+	ret = pilot_buffer_geometry(st, indio->buffer->length);
+	if (ret)
 		goto out;
-	}
 	value = pilot_read(st, PIL_STATUS);
 	if (value & (PIL_ACTIVE | PIL_QUEUED)) {
 		ret = -EBUSY;
