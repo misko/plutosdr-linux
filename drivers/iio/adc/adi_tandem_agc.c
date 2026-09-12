@@ -24,6 +24,7 @@
 #include <linux/workqueue.h>
 
 #include <linux/adi_tandem_agc.h>
+#include <uapi/linux/adi_rx_counter.h>
 
 #include "ad9361.h"
 
@@ -70,6 +71,8 @@
 
 enum tandem_attr {
 	TANDEM_ATTR_ABI_VERSION,
+	COUNTER_ATTR_VERSION,
+	COUNTER_ATTR_TOPOLOGY,
 	TANDEM_ATTR_FPGA_IDENTITY,
 	TANDEM_ATTR_FPGA_ABI,
 	TANDEM_ATTR_FEATURES,
@@ -94,6 +97,7 @@ struct adi_tandem_agc {
 	struct mutex lock;
 	bool session_open;
 	bool acquired;
+	bool counter_acquired;
 	bool permanent_fault;
 	u32 software_fault;
 	u32 epoch;
@@ -312,8 +316,16 @@ static int tandem_release_locked(struct adi_tandem_agc *st)
 {
 	int quiesce_ret, retire_ret = 0, restore_ret;
 
-	if (!st->acquired && !st->permanent_fault)
+	if (!st->acquired && !st->counter_acquired && !st->permanent_fault)
 		return 0;
+	if (st->counter_acquired) {
+		int counter_ret = ad9361_counter_release(st->phy, st);
+		if (!counter_ret)
+			st->counter_acquired = false;
+		else
+			st->permanent_fault = true;
+		return counter_ret;
+	}
 	cancel_delayed_work(&st->watchdog_work);
 
 	/* Stop decisions but retain actively-low FPGA pin ownership. */
@@ -375,7 +387,7 @@ static int tandem_acquire_locked(struct adi_tandem_agc *st,
 	u32 control;
 	int cleanup_ret = 0, release_ret, ret;
 
-	if (st->acquired)
+	if (st->acquired || st->counter_acquired)
 		return -EBUSY;
 	if (st->permanent_fault)
 		return -EIO;
@@ -520,10 +532,36 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 	struct adi_tandem_agc_acquire acquire;
 	struct adi_tandem_agc_status status;
 	struct adi_tandem_agc_caps caps;
+	struct adi_rx_counter_request counter;
 	int ret = 0;
 
 	mutex_lock(&st->lock);
+	if (st->counter_acquired && cmd != ADI_TANDEM_AGC_IOC_RELEASE) {
+		ret = -EBUSY;
+		goto out_ioctl;
+	}
 	switch (cmd) {
+	case ADI_RX_COUNTER_IOC_ACQUIRE:
+		if (copy_from_user(&counter, argp, sizeof(counter))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (counter.magic != ADI_RX_COUNTER_MAGIC ||
+		    counter.version != ADI_RX_COUNTER_VERSION || counter.size != sizeof(counter) ||
+		    counter.required_features != ADI_RX_COUNTER_FEATURES ||
+		    counter.scan_mask != 3 || counter.reserved[0] || counter.reserved[1]) {
+			ret = -EINVAL;
+			break;
+		}
+		if (st->acquired || st->permanent_fault) {
+			ret = -EBUSY;
+			break;
+		}
+		ret = ad9361_counter_acquire(st->phy, st, counter.sample_rate_hz,
+					     counter.samples_per_channel);
+		if (!ret)
+			st->counter_acquired = true;
+		break;
 	case ADI_TANDEM_AGC_IOC_GET_CAPS:
 		memset(&caps, 0, sizeof(caps));
 		caps.version = ADI_TANDEM_AGC_ABI_VERSION;
@@ -560,6 +598,7 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 	default:
 		ret = -ENOTTY;
 	}
+out_ioctl:
 	mutex_unlock(&st->lock);
 
 	return ret;
@@ -637,6 +676,12 @@ static ssize_t tandem_attr_show(struct device *dev,
 
 	mutex_lock(&st->lock);
 	switch (this_attr->address) {
+	case COUNTER_ATTR_VERSION:
+		value = 1;
+		break;
+	case COUNTER_ATTR_TOPOLOGY:
+		value = ad9361_counter_topology_supported(st->phy);
+		break;
 	case TANDEM_ATTR_ABI_VERSION:
 		value = ADI_TANDEM_AGC_ABI_VERSION;
 		break;
@@ -694,6 +739,8 @@ static ssize_t tandem_attr_show(struct device *dev,
 #define TANDEM_ATTR_RO(_name, _address) \
 	IIO_DEVICE_ATTR(_name, 0444, tandem_attr_show, NULL, _address)
 
+static TANDEM_ATTR_RO(counter_metadata_version, COUNTER_ATTR_VERSION);
+static TANDEM_ATTR_RO(counter_metadata_topology_supported, COUNTER_ATTR_TOPOLOGY);
 static TANDEM_ATTR_RO(abi_version, TANDEM_ATTR_ABI_VERSION);
 static TANDEM_ATTR_RO(fpga_identity, TANDEM_ATTR_FPGA_IDENTITY);
 static TANDEM_ATTR_RO(fpga_abi, TANDEM_ATTR_FPGA_ABI);
@@ -709,20 +756,22 @@ static TANDEM_ATTR_RO(transition_count, TANDEM_ATTR_TRANSITIONS);
 static TANDEM_ATTR_RO(overflow_count, TANDEM_ATTR_OVERFLOWS);
 
 static struct attribute *tandem_attrs[] = {
-	&iio_dev_attr_abi_version.dev_attr.attr,
-	&iio_dev_attr_fpga_identity.dev_attr.attr,
-	&iio_dev_attr_fpga_abi.dev_attr.attr,
-	&iio_dev_attr_features.dev_attr.attr,
-	&iio_dev_attr_state.dev_attr.attr,
-	&iio_dev_attr_ownership_epoch.dev_attr.attr,
-	&iio_dev_attr_fault_flags.dev_attr.attr,
-	&iio_dev_attr_fifo_depth.dev_attr.attr,
-	&iio_dev_attr_fifo_level.dev_attr.attr,
-	&iio_dev_attr_rx1_gain_index.dev_attr.attr,
-	&iio_dev_attr_rx2_gain_index.dev_attr.attr,
-	&iio_dev_attr_transition_count.dev_attr.attr,
-	&iio_dev_attr_overflow_count.dev_attr.attr,
-	NULL,
+    &iio_dev_attr_counter_metadata_version.dev_attr.attr,
+    &iio_dev_attr_counter_metadata_topology_supported.dev_attr.attr,
+    &iio_dev_attr_abi_version.dev_attr.attr,
+    &iio_dev_attr_fpga_identity.dev_attr.attr,
+    &iio_dev_attr_fpga_abi.dev_attr.attr,
+    &iio_dev_attr_features.dev_attr.attr,
+    &iio_dev_attr_state.dev_attr.attr,
+    &iio_dev_attr_ownership_epoch.dev_attr.attr,
+    &iio_dev_attr_fault_flags.dev_attr.attr,
+    &iio_dev_attr_fifo_depth.dev_attr.attr,
+    &iio_dev_attr_fifo_level.dev_attr.attr,
+    &iio_dev_attr_rx1_gain_index.dev_attr.attr,
+    &iio_dev_attr_rx2_gain_index.dev_attr.attr,
+    &iio_dev_attr_transition_count.dev_attr.attr,
+    &iio_dev_attr_overflow_count.dev_attr.attr,
+    NULL,
 };
 
 static const struct attribute_group tandem_attr_group = {

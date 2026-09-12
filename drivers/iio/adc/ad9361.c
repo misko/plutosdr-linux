@@ -37,6 +37,7 @@
 
 #include "ad9361.h"
 #include "ad9361_private.h"
+#include "cf_axi_adc.h"
 
 static const struct SynthLUT SynthLUT_FDD[LUT_FTDD_ENT][SYNTH_LUT_SIZE] = {
 {
@@ -2234,6 +2235,92 @@ static int ad9361_tandem_restore_locked(struct ad9361_rf_phy *phy)
 
 	return ret;
 }
+
+/* Counter capture shares configuration exclusion, never paired preparation.
+ * Lock order matches debug register access: ADC mlock, converter, PHY.
+ * The descriptor owns timestamp restoration even if iiOD is killed.
+ */
+bool ad9361_counter_topology_supported(struct ad9361_rf_phy *phy)
+{
+	return spi_get_device_id(phy->spi)->driver_data == ID_AD9361 && !phy->pdata->rx2tx2 &&
+	       phy->pdata->rx1tx1_mode_use_rx_num == 1;
+}
+EXPORT_SYMBOL_GPL(ad9361_counter_topology_supported);
+
+int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_rate_hz,
+			   u32 samples_per_channel)
+{
+	struct axiadc_converter *conv = spi_get_drvdata(phy->spi);
+	struct axiadc_state *adc;
+	int ret = 0;
+	u32 control;
+	if (!conv || !conv->indio_dev || !owner || !samples_per_channel ||
+	    (samples_per_channel & 1) || samples_per_channel > 0x7ffffffeU)
+		return -EINVAL;
+	adc = iio_priv(conv->indio_dev);
+	mutex_lock(&conv->indio_dev->mlock);
+	mutex_lock(&conv->lock);
+	mutex_lock(&phy->lock);
+	if (phy->tandem_owner || iio_buffer_enabled(conv->indio_dev)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	if (!ad9361_counter_topology_supported(phy) || phy->state->agc_mode[0] != RF_GAIN_MGC ||
+	    clk_get_rate(phy->clks[RX_SAMPL_CLK]) != sample_rate_hz) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	control = axiadc_read(adc, ADI_REG_GP_CONTROL);
+	if (control & 1) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	phy->counter_previous_control = control;
+	phy->tandem_owner = owner;
+	phy->counter_owned = true;
+	conv->counter_capture_owned = true;
+	/* Four bytes per complex sample, one timestamp per packed IQ frame. */
+	axiadc_write(adc, ADI_REG_GP_CONTROL, samples_per_channel);
+	if (axiadc_read(adc, ADI_REG_GP_CONTROL) != samples_per_channel) {
+		axiadc_write(adc, ADI_REG_GP_CONTROL, control);
+		phy->tandem_owner = NULL;
+		phy->counter_owned = false;
+		conv->counter_capture_owned = false;
+		ret = -EIO;
+	}
+out:
+	mutex_unlock(&phy->lock);
+	mutex_unlock(&conv->lock);
+	mutex_unlock(&conv->indio_dev->mlock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ad9361_counter_acquire);
+
+int ad9361_counter_release(struct ad9361_rf_phy *phy, void *owner)
+{
+	struct axiadc_converter *conv = spi_get_drvdata(phy->spi);
+	struct axiadc_state *adc = iio_priv(conv->indio_dev);
+	int ret = 0;
+	mutex_lock(&conv->lock);
+	mutex_lock(&phy->lock);
+	if (!phy->counter_owned || phy->tandem_owner != owner) {
+		ret = -EPERM;
+		goto out;
+	}
+	axiadc_write(adc, ADI_REG_GP_CONTROL, phy->counter_previous_control);
+	if (axiadc_read(adc, ADI_REG_GP_CONTROL) != phy->counter_previous_control) {
+		ret = -EIO;
+		goto out;
+	}
+	conv->counter_capture_owned = false;
+	phy->counter_owned = false;
+	phy->tandem_owner = NULL;
+out:
+	mutex_unlock(&phy->lock);
+	mutex_unlock(&conv->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ad9361_counter_release);
 
 int ad9361_tandem_prepare(struct ad9361_rf_phy *phy, void *owner,
 			  const struct ad9361_tandem_config *config,

@@ -172,8 +172,10 @@ struct ad9361_rf_phy {
 	struct mutex		lock;
 	char			*bin_attr_buf;
 	u32 			ad9361_debugfs_entry_index;
-	/* Protected by lock. Only the tandem session API may set this owner. */
+	/* Protected by lock. Shared exclusion for paired or counter capture leases. */
 	void			*tandem_owner;
+	bool counter_owned;
+	u32 counter_previous_control;
 	u8			tandem_snapshot[16];
 
 	struct ad9361_ext_band_ctl	*ext_band_ctl;
@@ -214,6 +216,10 @@ int ad9361_set_rx_port(struct ad9361_rf_phy *phy, enum rx_port_sel sel);
 int ad9361_tandem_prepare(struct ad9361_rf_phy *phy, void *owner,
 			  const struct ad9361_tandem_config *config,
 			  struct ad9361_tandem_result *result);
+bool ad9361_counter_topology_supported(struct ad9361_rf_phy *phy);
+int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_rate_hz,
+			   u32 samples_per_channel);
+int ad9361_counter_release(struct ad9361_rf_phy *phy, void *owner);
 int ad9361_tandem_arm(struct ad9361_rf_phy *phy, void *owner);
 int ad9361_tandem_verify(struct ad9361_rf_phy *phy, void *owner,
 			 u8 expected_rx1, u8 expected_rx2);

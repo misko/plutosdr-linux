@@ -226,6 +226,8 @@ struct axiadc_converter {
 
 	struct delayed_work	watchdog_work;
 	bool			sample_rate_read_only;
+	/* Protected by lock. Counter lease freezes ADC configuration. */
+	bool counter_capture_owned;
 	bool			running;
 
 	int (*reg_access)(struct iio_dev *indio_dev, unsigned int reg,

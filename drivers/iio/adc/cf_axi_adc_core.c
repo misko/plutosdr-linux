@@ -241,6 +241,10 @@ static ssize_t axiadc_debugfs_pncheck_write(struct file *file,
 		mode = ADC_PN_OFF;
 
 	mutex_lock(&conv->lock);
+	if (conv->counter_capture_owned) {
+		mutex_unlock(&conv->lock);
+		return -EBUSY;
+	}
 
 	for (i = 0; i < axiadc_num_phys_channels(st); i++) {
 		if (conv->set_pnsel)
@@ -280,6 +284,10 @@ static int axiadc_reg_access(struct iio_dev *indio_dev,
 		return -EINVAL;
 
 	mutex_lock(&conv->lock);
+	if (!readval && conv->counter_capture_owned) {
+		mutex_unlock(&conv->lock);
+		return -EBUSY;
+	}
 
 	if (!(reg & DEBUGFS_DRA_PCORE_REG_MAGIC)) {
 		struct axiadc_converter *conv = to_converter(st->dev_spi);
@@ -298,7 +306,7 @@ static int axiadc_reg_access(struct iio_dev *indio_dev,
 	}
 	mutex_unlock(&conv->lock);
 
-	return 0;
+	return ret;
 }
 
 static int axiadc_decimation_set(struct axiadc_state *st,
@@ -416,6 +424,10 @@ static ssize_t axiadc_sync_start_store(struct device *dev,
 		return ret;
 
 	mutex_lock(&conv->lock);
+	if (conv->counter_capture_owned) {
+		mutex_unlock(&conv->lock);
+		return -EBUSY;
+	}
 	if (st->ext_sync_avail) {
 		switch (ret) {
 		case 0:
@@ -598,11 +610,8 @@ static int axiadc_read_raw(struct iio_dev *indio_dev,
 	return -EINVAL;
 }
 
-static int axiadc_write_raw(struct iio_dev *indio_dev,
-			       struct iio_chan_spec const *chan,
-			       int val,
-			       int val2,
-			       long mask)
+static int axiadc_write_raw_unlocked(struct iio_dev *indio_dev, struct iio_chan_spec const *chan,
+				     int val, int val2, long mask)
 {
 	struct axiadc_state *st = iio_priv(indio_dev);
 	struct axiadc_converter *conv = to_converter(st->dev_spi);
@@ -696,6 +705,20 @@ static int axiadc_write_raw(struct iio_dev *indio_dev,
 	}
 }
 
+static int axiadc_write_raw(struct iio_dev *indio_dev, const struct iio_chan_spec *chan, int val,
+			    int val2, long mask)
+{
+	struct axiadc_state *st = iio_priv(indio_dev);
+	struct axiadc_converter *conv = to_converter(st->dev_spi);
+	int ret;
+	mutex_lock(&conv->lock);
+	ret = conv->counter_capture_owned
+		  ? -EBUSY
+		  : axiadc_write_raw_unlocked(indio_dev, chan, val, val2, mask);
+	mutex_unlock(&conv->lock);
+	return ret;
+}
+
 static int axiadc_read_label(struct iio_dev *indio_dev,
 			     const struct iio_chan_spec *chan, char *label)
 {
@@ -775,6 +798,9 @@ static int axiadc_update_scan_mode(struct iio_dev *indio_dev,
 {
 	struct axiadc_state *st = iio_priv(indio_dev);
 	unsigned i, ctrl;
+	struct axiadc_converter *conv = to_converter(st->dev_spi);
+	if (conv->counter_capture_owned && (indio_dev->masklength != 2 || scan_mask[0] != 3))
+		return -EBUSY;
 
 	for (i = 0; i < indio_dev->masklength; i++) {
 		if (i > (st->have_slave_channels - 1))
