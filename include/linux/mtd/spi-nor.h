@@ -422,6 +422,7 @@ struct spi_nor {
 	u8			program_opcode;
 	u32			jedec_id;
 	u16			curbank;
+	bool			bank_valid; /* curbank was read back successfully */
 	u16			n_sectors;
 	u32			sector_size;
 	enum spi_nor_protocol	read_proto;

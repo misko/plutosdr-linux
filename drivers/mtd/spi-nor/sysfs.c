@@ -4,6 +4,7 @@
 #include <linux/spi/spi.h>
 #include <linux/spi/spi-mem.h>
 #include <linux/sysfs.h>
+#include <linux/sizes.h>
 
 #include "core.h"
 
@@ -40,7 +41,31 @@ static ssize_t jedec_id_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(jedec_id);
 
+/* Physical capacity and selected protocol; these are evidence, not a grant. */
+static ssize_t size_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct spi_mem *mem = spi_get_drvdata(to_spi_device(dev));
+	struct spi_nor *nor = spi_mem_get_drvdata(mem);
+
+	return sysfs_emit(buf, "%llu\n", (unsigned long long)nor->mtd.size);
+}
+static DEVICE_ATTR_RO(size);
+
+static ssize_t addressing_show(struct device *dev, struct device_attribute *attr,
+			       char *buf)
+{
+	struct spi_mem *mem = spi_get_drvdata(to_spi_device(dev));
+	struct spi_nor *nor = spi_mem_get_drvdata(mem);
+
+	return sysfs_emit(buf, "%s\n", nor->addr_width == 4 ? "four-byte" :
+		(nor->mtd.size >> (nor->shift + nor->isstacked)) > SZ_16M ?
+		"verified-ear-v1" : "three-byte");
+}
+static DEVICE_ATTR_RO(addressing);
+
 static struct attribute *spi_nor_sysfs_entries[] = {
+	&dev_attr_size.attr,
+	&dev_attr_addressing.attr,
 	&dev_attr_manufacturer.attr,
 	&dev_attr_partname.attr,
 	&dev_attr_jedec_id.attr,

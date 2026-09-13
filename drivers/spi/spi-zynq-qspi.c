@@ -150,6 +150,7 @@ struct zynq_qspi {
 	struct completion data_completion;
 	u32 is_dual;
 	bool is_stripe;
+	bool faulted; /* An incomplete wire transaction requires controller reset. */
 };
 
 /*
@@ -546,12 +547,15 @@ static int zynq_qspi_exec_mem_op(struct spi_mem *mem,
 {
 	struct zynq_qspi *xqspi = spi_controller_get_devdata(mem->spi->master);
 	int err = 0, i;
-	u8 *tmpbuf;
+	u8 *tmpbuf = NULL;
 	u8 opaddr[ZYNQ_QSPI_MAX_ADDR_WIDTH];
 
 	dev_dbg(xqspi->dev, "cmd:%#x mode:%d.%d.%d.%d\n",
 		op->cmd.opcode, op->cmd.buswidth, op->addr.buswidth,
 		op->dummy.buswidth, op->data.buswidth);
+
+	if (xqspi->faulted)
+		return -EIO;
 
 	if (op->addr.nbytes > ZYNQ_QSPI_MAX_ADDR_WIDTH)
 		return -EINVAL;
@@ -569,8 +573,10 @@ static int zynq_qspi_exec_mem_op(struct spi_mem *mem,
 		zynq_qspi_write(xqspi, ZYNQ_QSPI_IEN_OFFSET,
 				ZYNQ_QSPI_IXR_RXTX_MASK);
 		if (!wait_for_completion_timeout(&xqspi->data_completion,
-							       msecs_to_jiffies(1000)))
+							       msecs_to_jiffies(1000))) {
 			err = -ETIMEDOUT;
+			goto out;
+		}
 	}
 
 	if (op->addr.nbytes) {
@@ -588,14 +594,18 @@ static int zynq_qspi_exec_mem_op(struct spi_mem *mem,
 		zynq_qspi_write(xqspi, ZYNQ_QSPI_IEN_OFFSET,
 				ZYNQ_QSPI_IXR_RXTX_MASK);
 		if (!wait_for_completion_timeout(&xqspi->data_completion,
-							       msecs_to_jiffies(1000)))
+							       msecs_to_jiffies(1000))) {
 			err = -ETIMEDOUT;
+			goto out;
+		}
 	}
 
 	if (op->dummy.nbytes) {
 		tmpbuf = kzalloc(op->dummy.nbytes, GFP_KERNEL);
-		if (!tmpbuf)
-			return -ENOMEM;
+		if (!tmpbuf) {
+			err = -ENOMEM;
+			goto out;
+		}
 
 		memset(tmpbuf, 0xff, op->dummy.nbytes);
 		reinit_completion(&xqspi->data_completion);
@@ -607,10 +617,13 @@ static int zynq_qspi_exec_mem_op(struct spi_mem *mem,
 		zynq_qspi_write(xqspi, ZYNQ_QSPI_IEN_OFFSET,
 				ZYNQ_QSPI_IXR_RXTX_MASK);
 		if (!wait_for_completion_timeout(&xqspi->data_completion,
-							       msecs_to_jiffies(1000)))
+							       msecs_to_jiffies(1000))) {
 			err = -ETIMEDOUT;
+			goto out;
+		}
 
 		kfree(tmpbuf);
+		tmpbuf = NULL;
 	}
 
 	if (op->data.nbytes) {
@@ -633,9 +646,28 @@ static int zynq_qspi_exec_mem_op(struct spi_mem *mem,
 		zynq_qspi_write(xqspi, ZYNQ_QSPI_IEN_OFFSET,
 				ZYNQ_QSPI_IXR_RXTX_MASK);
 		if (!wait_for_completion_timeout(&xqspi->data_completion,
-							       msecs_to_jiffies(1000)))
+							       msecs_to_jiffies(1000))) {
 			err = -ETIMEDOUT;
+			goto out;
+		}
 	}
+out:
+	if (err) {
+		/* Stop IRQ access to phase buffers before releasing their storage.
+		 * Queued TX bytes may be incomplete: refuse further transactions
+		 * rather than send them as part of an unrelated flash command.
+		 */
+		xqspi->faulted = true;
+		zynq_qspi_write(xqspi, ZYNQ_QSPI_IDIS_OFFSET,
+				ZYNQ_QSPI_IXR_ALL_MASK);
+		zynq_qspi_write(xqspi, ZYNQ_QSPI_ENABLE_OFFSET, 0);
+		synchronize_irq(xqspi->irq);
+		xqspi->txbuf = NULL;
+		xqspi->rxbuf = NULL;
+		xqspi->tx_bytes = 0;
+		xqspi->rx_bytes = 0;
+	}
+	kfree(tmpbuf);
 	if (xqspi->is_stripe)
 		xqspi->is_stripe = false;
 

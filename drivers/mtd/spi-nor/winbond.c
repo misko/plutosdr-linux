@@ -54,6 +54,9 @@ w25q256_post_bfpt_fixups(struct spi_nor *nor,
 
 static void w25q256_post_sfdp_fixups(struct spi_nor *nor)
 {
+	/* FV and JV share ef4019 and support C8h/C5h bank selection. */
+	nor->flags |= SNOR_F_HAS_EAR;
+
 	/*
 	 * Opcode 4Bh exposes a factory-programmed UID on both FV and JV.
 	 * Install this in post_sfdp rather than post_bfpt: the Zynq QSPI path
@@ -166,15 +169,7 @@ static int winbond_set_4byte_addr_mode(struct spi_nor *nor, bool enable)
 	 * Register to be set to 1, so all 3-byte-address reads come from the
 	 * second 16M. We must clear the register to enable normal behavior.
 	 */
-	ret = spi_nor_write_enable(nor);
-	if (ret)
-		return ret;
-
-	ret = spi_nor_write_ear(nor, 0);
-	if (ret)
-		return ret;
-
-	return spi_nor_write_disable(nor);
+	return spi_nor_write_ear(nor, 0);
 }
 
 static const struct spi_nor_otp_ops winbond_otp_ops = {

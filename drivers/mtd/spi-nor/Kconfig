@@ -10,6 +10,13 @@ menuconfig MTD_SPI_NOR
 
 if MTD_SPI_NOR
 
+config MTD_SPI_NOR_KUNIT_TEST
+	bool "SPI NOR bank addressing regression tests"
+	depends on KUNIT=y && MTD_SPI_NOR=y
+	help
+	  Test register sequencing and production MTD operations using a fake
+	  flash, through both legacy callbacks and spi-mem. No hardware needed.
+
 config MTD_SPI_NOR_USE_4K_SECTORS
 	bool "Use small 4096 B erase sectors"
 	default y
