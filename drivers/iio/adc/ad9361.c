@@ -30,6 +30,7 @@
 #include <linux/iio/sysfs.h>
 
 #include <linux/clk.h>
+#include <linux/crc32.h>
 #include <linux/clkdev.h>
 #include <linux/clk-provider.h>
 
@@ -2240,6 +2241,52 @@ static int ad9361_tandem_restore_locked(struct ad9361_rf_phy *phy)
  * Lock order matches debug register access: ADC mlock, converter, PHY.
  * The descriptor owns timestamp restoration even if iiOD is killed.
  */
+static int ad9361_fastlock_recall(struct ad9361_rf_phy *phy, bool tx,
+				  u32 profile);
+static int ad9361_fastlock_save(struct ad9361_rf_phy *phy, bool tx,
+				u32 profile, u8 *values);
+static int ad9361_fastlock_prepare(struct ad9361_rf_phy *phy, bool tx,
+				   u32 profile, bool prepare);
+
+static int ad9361_counter_profile_crc(struct ad9361_rf_phy *phy, u32 profile,
+				      u32 *crc)
+{
+	u8 values[RX_FAST_LOCK_CONFIG_WORD_NUM];
+	int ret;
+
+	ret = ad9361_fastlock_save(phy, false, profile, values);
+	if (ret)
+		return ret;
+	*crc = crc32_le(~0U, values, sizeof(values)) ^ ~0U;
+	return 0;
+}
+
+static bool ad9361_counter_frequency_matches(u64 actual, u64 expected)
+{
+	return actual >= expected ? actual - expected <= 2 : expected - actual <= 2;
+}
+
+/* Must be called with the converter and PHY locks held. */
+static int ad9361_counter_restore_rx_lo(struct ad9361_rf_phy *phy)
+{
+	u64 actual;
+	int ret;
+
+	ret = ad9361_fastlock_prepare(phy, false, 0, false);
+	if (ret)
+		return ret;
+	ret = clk_set_rate(phy->clks[RX_RFPLL],
+			   ad9361_to_clk(phy->counter_previous_rx_lo_hz));
+	if (ret)
+		return ret;
+	actual = ad9361_from_clk(clk_get_rate(phy->clks[RX_RFPLL]));
+	if (!ad9361_counter_frequency_matches(actual,
+					      phy->counter_previous_rx_lo_hz))
+		return -EIO;
+	phy->counter_scan_restore_required = false;
+	return 0;
+}
+
 bool ad9361_counter_topology_supported(struct ad9361_rf_phy *phy)
 {
 	return spi_get_device_id(phy->spi)->driver_data == ID_AD9361 && !phy->pdata->rx2tx2 &&
@@ -2266,6 +2313,7 @@ int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_ra
 		goto out;
 	}
 	if (!ad9361_counter_topology_supported(phy) || phy->state->agc_mode[0] != RF_GAIN_MGC ||
+	    phy->state->fastlock.current_profile[0] ||
 	    clk_get_rate(phy->clks[RX_SAMPL_CLK]) != sample_rate_hz) {
 		ret = -EOPNOTSUPP;
 		goto out;
@@ -2276,6 +2324,11 @@ int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_ra
 		goto out;
 	}
 	phy->counter_previous_control = control;
+	phy->counter_previous_rx_lo_hz =
+		ad9361_from_clk(clk_get_rate(phy->clks[RX_RFPLL]));
+	phy->counter_scan_profile_mask = 0;
+	phy->counter_scan_configured = false;
+	phy->counter_scan_restore_required = false;
 	phy->tandem_owner = owner;
 	phy->counter_owned = true;
 	conv->counter_capture_owned = true;
@@ -2296,6 +2349,148 @@ out:
 }
 EXPORT_SYMBOL_GPL(ad9361_counter_acquire);
 
+int ad9361_counter_configure_scan(struct ad9361_rf_phy *phy, void *owner,
+				  u32 profile_mask, const u64 *frequency_hz,
+				  const u32 *profile_crc)
+{
+	struct axiadc_converter *conv = spi_get_drvdata(phy->spi);
+	u32 verified_crc[8] = { 0 };
+	u64 actual;
+	int ret = 0, restore_ret, i;
+
+	if (!conv || !conv->indio_dev || !owner || !frequency_hz ||
+	    !profile_crc || !profile_mask || profile_mask & ~GENMASK(7, 0))
+		return -EINVAL;
+
+	mutex_lock(&conv->indio_dev->mlock);
+	mutex_lock(&conv->lock);
+	mutex_lock(&phy->lock);
+	if (!phy->counter_owned || phy->tandem_owner != owner) {
+		ret = -EPERM;
+		goto out;
+	}
+	if (iio_buffer_enabled(conv->indio_dev)) {
+		ret = -EBUSY;
+		goto out;
+	}
+
+	phy->counter_scan_configured = false;
+	phy->counter_scan_profile_mask = 0;
+	for (i = 0; i < 8; i++) {
+		if (!(profile_mask & BIT(i)))
+			continue;
+		if (!frequency_hz[i] ||
+		    phy->state->fastlock.entry[0][i].flags != FASTLOOK_INIT) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = ad9361_counter_profile_crc(phy, i, &verified_crc[i]);
+		if (ret || verified_crc[i] != profile_crc[i]) {
+			ret = ret ? ret : -EINVAL;
+			break;
+		}
+		phy->counter_scan_restore_required = true;
+		ret = ad9361_fastlock_recall(phy, false, i);
+		if (ret)
+			break;
+		actual = ad9361_from_clk(clk_get_rate(phy->clks[RX_RFPLL]));
+		if (!ad9361_counter_frequency_matches(actual, frequency_hz[i])) {
+			ret = -ERANGE;
+			break;
+		}
+		ret = ad9361_counter_profile_crc(phy, i, &verified_crc[i]);
+		if (ret)
+			break;
+	}
+
+	restore_ret = ad9361_counter_restore_rx_lo(phy);
+	if (restore_ret)
+		ret = restore_ret;
+	if (!ret) {
+		for (i = 0; i < 8; i++) {
+			phy->counter_scan_frequency_hz[i] = frequency_hz[i];
+			phy->counter_scan_profile_crc[i] = verified_crc[i];
+		}
+		phy->counter_scan_profile_mask = profile_mask;
+		phy->counter_scan_configured = true;
+	}
+out:
+	mutex_unlock(&phy->lock);
+	mutex_unlock(&conv->lock);
+	mutex_unlock(&conv->indio_dev->mlock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ad9361_counter_configure_scan);
+
+int ad9361_counter_fastlock_recall(struct ad9361_rf_phy *phy, void *owner,
+				   u32 profile, u64 *frequency_hz,
+				   u32 *profile_crc, u32 *counter_before,
+				   u32 *counter_after)
+{
+	struct axiadc_converter *conv = spi_get_drvdata(phy->spi);
+	struct axiadc_state *adc;
+	u64 actual;
+	u32 crc;
+	int ret = 0;
+
+	if (!conv || !conv->indio_dev || !owner || !frequency_hz ||
+	    !profile_crc || !counter_before || !counter_after || profile >= 8)
+		return -EINVAL;
+	adc = iio_priv(conv->indio_dev);
+
+	mutex_lock(&conv->indio_dev->mlock);
+	mutex_lock(&conv->lock);
+	mutex_lock(&phy->lock);
+	if (!phy->counter_owned || phy->tandem_owner != owner) {
+		ret = -EPERM;
+		goto out;
+	}
+	if (!phy->counter_scan_configured ||
+	    !(phy->counter_scan_profile_mask & BIT(profile))) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = ad9361_counter_profile_crc(phy, profile, &crc);
+	if (ret)
+		goto fault_restore;
+	if (crc != phy->counter_scan_profile_crc[profile]) {
+		ret = -ESTALE;
+		goto fault_restore;
+	}
+
+	*counter_before = axiadc_read(adc, ADI_REG_GP_STATUS);
+	phy->counter_scan_restore_required = true;
+	ret = ad9361_fastlock_recall(phy, false, profile);
+	*counter_after = axiadc_read(adc, ADI_REG_GP_STATUS);
+	if (ret)
+		goto fault_restore;
+	actual = ad9361_from_clk(clk_get_rate(phy->clks[RX_RFPLL]));
+	if (!ad9361_counter_frequency_matches(actual,
+					      phy->counter_scan_frequency_hz[profile])) {
+		ret = -EIO;
+		goto fault_restore;
+	}
+	ret = ad9361_counter_profile_crc(phy, profile, &crc);
+	if (ret)
+		goto fault_restore;
+	phy->counter_scan_profile_crc[profile] = crc;
+	*frequency_hz = actual;
+	*profile_crc = crc;
+	goto out;
+
+fault_restore:
+	phy->counter_scan_configured = false;
+	phy->counter_scan_profile_mask = 0;
+	if (ad9361_counter_restore_rx_lo(phy))
+		ret = -EIO;
+out:
+	mutex_unlock(&phy->lock);
+	mutex_unlock(&conv->lock);
+	mutex_unlock(&conv->indio_dev->mlock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ad9361_counter_fastlock_recall);
+
 int ad9361_counter_release(struct ad9361_rf_phy *phy, void *owner)
 {
 	struct axiadc_converter *conv = spi_get_drvdata(phy->spi);
@@ -2307,12 +2502,21 @@ int ad9361_counter_release(struct ad9361_rf_phy *phy, void *owner)
 		ret = -EPERM;
 		goto out;
 	}
+	if (phy->counter_scan_restore_required ||
+	    phy->state->fastlock.current_profile[0]) {
+		ret = ad9361_counter_restore_rx_lo(phy);
+		if (ret)
+			goto out;
+	}
 	axiadc_write(adc, ADI_REG_GP_CONTROL, phy->counter_previous_control);
 	if (axiadc_read(adc, ADI_REG_GP_CONTROL) != phy->counter_previous_control) {
 		ret = -EIO;
 		goto out;
 	}
 	conv->counter_capture_owned = false;
+	phy->counter_scan_configured = false;
+	phy->counter_scan_restore_required = false;
+	phy->counter_scan_profile_mask = 0;
 	phy->counter_owned = false;
 	phy->tandem_owner = NULL;
 out:
@@ -4849,13 +5053,16 @@ static int ad9361_fastlock_readval(struct spi_device *spi, bool tx,
 				u32 profile, u32 word)
 {
 	u32 offs = 0;
+	int ret;
 
 	if (tx)
 		offs = REG_TX_FAST_LOCK_SETUP - REG_RX_FAST_LOCK_SETUP;
 
-	ad9361_spi_write(spi, REG_RX_FAST_LOCK_PROGRAM_ADDR + offs,
-			RX_FAST_LOCK_PROFILE_ADDR(profile) |
-			RX_FAST_LOCK_PROFILE_WORD(word));
+	ret = ad9361_spi_write(spi, REG_RX_FAST_LOCK_PROGRAM_ADDR + offs,
+			       RX_FAST_LOCK_PROFILE_ADDR(profile) |
+			       RX_FAST_LOCK_PROFILE_WORD(word));
+	if (ret)
+		return ret;
 
 	return ad9361_spi_read(spi, REG_RX_FAST_LOCK_PROGRAM_READ + offs);
 }
@@ -5086,14 +5293,17 @@ static int ad9361_fastlock_recall(struct ad9361_rf_phy *phy, bool tx, u32 profil
 static int ad9361_fastlock_save(struct ad9361_rf_phy *phy, bool tx,
 				u32 profile, u8 *values)
 {
-	int i;
+	int i, value;
 
 	dev_dbg(&phy->spi->dev, "%s: %s Profile %d:",
 		__func__, tx ? "TX" : "RX", profile);
 
-	for (i = 0; i < RX_FAST_LOCK_CONFIG_WORD_NUM; i++)
-		values[i] = ad9361_fastlock_readval(phy->spi, tx, profile, i);
-
+	for (i = 0; i < RX_FAST_LOCK_CONFIG_WORD_NUM; i++) {
+		value = ad9361_fastlock_readval(phy->spi, tx, profile, i);
+		if (value < 0)
+			return value;
+		values[i] = value;
+	}
 
 	return 0;
 }
@@ -7951,6 +8161,10 @@ static ssize_t ad9361_phy_lo_read(struct iio_dev *indio_dev,
 		int i;
 		ret = ad9361_fastlock_save(phy, chan->channel == 1,
 			st->fastlock.save_profile, faslock_vals);
+		if (ret) {
+			mutex_unlock(&phy->lock);
+			return ret;
+		}
 		len = sprintf(buf, "%u ", st->fastlock.save_profile);
 
 		for (i = 0; i < RX_FAST_LOCK_CONFIG_WORD_NUM; i++)

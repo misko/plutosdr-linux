@@ -104,6 +104,8 @@
 #define ADI_USR_CHANMAX(x)		(((x) & 0xFF) << 0)
 #define ADI_TO_USR_CHANMAX(x)		(((x) >> 0) & 0xFF)
 
+/* Coherent low word of the source sample counter on timestamp builds. */
+#define ADI_REG_GP_STATUS		0x00B8
 #define ADI_REG_GP_CONTROL		0x00BC
 
 #define ADI_REG_CLOCKS_PER_PPS		0x00C0

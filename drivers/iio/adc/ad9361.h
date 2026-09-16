@@ -176,6 +176,12 @@ struct ad9361_rf_phy {
 	void			*tandem_owner;
 	bool counter_owned;
 	u32 counter_previous_control;
+	u64 counter_previous_rx_lo_hz;
+	u64 counter_scan_frequency_hz[8];
+	u32 counter_scan_profile_crc[8];
+	u32 counter_scan_profile_mask;
+	bool counter_scan_configured;
+	bool counter_scan_restore_required;
 	u8			tandem_snapshot[16];
 
 	struct ad9361_ext_band_ctl	*ext_band_ctl;
@@ -220,6 +226,13 @@ bool ad9361_counter_topology_supported(struct ad9361_rf_phy *phy);
 int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_rate_hz,
 			   u32 samples_per_channel);
 int ad9361_counter_release(struct ad9361_rf_phy *phy, void *owner);
+int ad9361_counter_configure_scan(struct ad9361_rf_phy *phy, void *owner,
+				  u32 profile_mask, const u64 *frequency_hz,
+				  const u32 *profile_crc);
+int ad9361_counter_fastlock_recall(struct ad9361_rf_phy *phy, void *owner,
+				   u32 profile, u64 *frequency_hz,
+				   u32 *profile_crc, u32 *counter_before,
+				   u32 *counter_after);
 int ad9361_tandem_arm(struct ad9361_rf_phy *phy, void *owner);
 int ad9361_tandem_verify(struct ad9361_rf_phy *phy, void *owner,
 			 u8 expected_rx1, u8 expected_rx2);

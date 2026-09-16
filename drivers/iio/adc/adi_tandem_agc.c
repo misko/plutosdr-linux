@@ -533,10 +533,19 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 	struct adi_tandem_agc_status status;
 	struct adi_tandem_agc_caps caps;
 	struct adi_rx_counter_request counter;
+	struct adi_rx_counter_scan_config scan_config;
+	struct adi_rx_counter_scan_recall recall;
+	struct adi_rx_counter_scan_caps scan_caps;
+	u64 scan_frequency[ADI_RX_COUNTER_SCAN_MAX_PROFILES];
+	u32 scan_crc[ADI_RX_COUNTER_SCAN_MAX_PROFILES];
+	unsigned int i;
 	int ret = 0;
 
 	mutex_lock(&st->lock);
-	if (st->counter_acquired && cmd != ADI_TANDEM_AGC_IOC_RELEASE) {
+	if (st->counter_acquired && cmd != ADI_TANDEM_AGC_IOC_RELEASE &&
+	    cmd != ADI_RX_COUNTER_IOC_CONFIGURE_SCAN &&
+	    cmd != ADI_RX_COUNTER_IOC_RECALL &&
+	    cmd != ADI_RX_COUNTER_IOC_GET_SCAN_CAPS) {
 		ret = -EBUSY;
 		goto out_ioctl;
 	}
@@ -561,6 +570,91 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 					     counter.samples_per_channel);
 		if (!ret)
 			st->counter_acquired = true;
+		break;
+	case ADI_RX_COUNTER_IOC_CONFIGURE_SCAN:
+		if (!st->counter_acquired) {
+			ret = -ENODATA;
+			break;
+		}
+		if (copy_from_user(&scan_config, argp, sizeof(scan_config))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (scan_config.magic != ADI_RX_COUNTER_MAGIC ||
+		    scan_config.version != ADI_RX_COUNTER_SCAN_VERSION ||
+		    scan_config.size != sizeof(scan_config) ||
+		    !scan_config.profile_mask ||
+		    scan_config.profile_mask &
+			~GENMASK(ADI_RX_COUNTER_SCAN_MAX_PROFILES - 1, 0) ||
+		    scan_config.reserved) {
+			ret = -EINVAL;
+			break;
+		}
+		for (i = 0; i < ADI_RX_COUNTER_SCAN_MAX_PROFILES; i++) {
+			bool enabled = scan_config.profile_mask & BIT(i);
+
+			if (scan_config.profiles[i].reserved ||
+			    (!enabled && (scan_config.profiles[i].frequency_hz ||
+					 scan_config.profiles[i].crc32)) ||
+			    (enabled && !scan_config.profiles[i].frequency_hz)) {
+				ret = -EINVAL;
+				break;
+			}
+			scan_frequency[i] = scan_config.profiles[i].frequency_hz;
+			scan_crc[i] = scan_config.profiles[i].crc32;
+		}
+		if (!ret)
+			ret = ad9361_counter_configure_scan(st->phy, st,
+							    scan_config.profile_mask,
+							    scan_frequency, scan_crc);
+		break;
+	case ADI_RX_COUNTER_IOC_RECALL:
+		if (!st->counter_acquired) {
+			ret = -ENODATA;
+			break;
+		}
+		if (copy_from_user(&recall, argp, sizeof(recall))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (recall.magic != ADI_RX_COUNTER_MAGIC ||
+		    recall.version != ADI_RX_COUNTER_SCAN_VERSION ||
+		    recall.size != sizeof(recall) || recall.flags ||
+		    recall.frequency_hz || recall.profile_crc32 ||
+		    recall.counter_before || recall.counter_after ||
+		    recall.reserved[0] || recall.reserved[1] ||
+		    recall.reserved[2]) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = ad9361_counter_fastlock_recall(st->phy, st,
+						     recall.profile,
+						     &recall.frequency_hz,
+						     &recall.profile_crc32,
+						     &recall.counter_before,
+						     &recall.counter_after);
+		if (!ret && copy_to_user(argp, &recall, sizeof(recall))) {
+			/* A hop without its receipt cannot remain an active session. */
+			int release_ret = ad9361_counter_release(st->phy, st);
+
+			if (!release_ret)
+				st->counter_acquired = false;
+			else
+				st->permanent_fault = true;
+			ret = -EFAULT;
+		}
+		break;
+	case ADI_RX_COUNTER_IOC_GET_SCAN_CAPS:
+		memset(&scan_caps, 0, sizeof(scan_caps));
+		scan_caps.magic = ADI_RX_COUNTER_MAGIC;
+		scan_caps.version = ADI_RX_COUNTER_SCAN_VERSION;
+		scan_caps.size = sizeof(scan_caps);
+		scan_caps.features = ADI_RX_COUNTER_SCAN_FEATURES;
+		scan_caps.maximum_profiles = ADI_RX_COUNTER_SCAN_MAX_PROFILES;
+		scan_caps.source_counter_bits = 32;
+		scan_caps.frequency_resolution_hz = 2;
+		if (copy_to_user(argp, &scan_caps, sizeof(scan_caps)))
+			ret = -EFAULT;
 		break;
 	case ADI_TANDEM_AGC_IOC_GET_CAPS:
 		memset(&caps, 0, sizeof(caps));
