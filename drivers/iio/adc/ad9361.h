@@ -236,6 +236,8 @@ int ad9361_counter_fastlock_recall(struct ad9361_rf_phy *phy, void *owner,
 				   u32 profile, u64 *frequency_hz,
 				   u32 *profile_crc, u32 *counter_before,
 				   u32 *counter_after);
+int ad9361_counter_snapshot(struct ad9361_rf_phy *phy, void *owner,
+			    u32 *counter);
 int ad9361_tandem_arm(struct ad9361_rf_phy *phy, void *owner);
 int ad9361_tandem_verify(struct ad9361_rf_phy *phy, void *owner,
 			 u8 expected_rx1, u8 expected_rx2);

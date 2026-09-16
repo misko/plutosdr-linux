@@ -9,7 +9,7 @@
 #define ADI_RX_COUNTER_FEATURES 7U /* counter, canonical CI16, exact gaps */
 #define ADI_RX_COUNTER_SCAN_VERSION 1U
 #define ADI_RX_COUNTER_SCAN_MAX_PROFILES 8U
-#define ADI_RX_COUNTER_SCAN_FEATURES 0x0fU
+#define ADI_RX_COUNTER_SCAN_FEATURES 0x1fU
 struct adi_rx_counter_request {
 	__u32 magic;
 	__u16 version;
@@ -88,6 +88,19 @@ struct adi_rx_counter_scan_release {
 	__u32 reserved[4];
 };
 
+/*
+ * Owner-only coherent source-time sample used to pace dwell boundaries
+ * independently of DMA block completion.
+ */
+struct adi_rx_counter_scan_snapshot {
+	__u32 magic;
+	__u16 version;
+	__u16 size;
+	__u32 flags;
+	__u32 counter;
+	__u32 reserved[4];
+};
+
 #define ADI_RX_COUNTER_IOC_ACQUIRE _IOW('T', 0x20, struct adi_rx_counter_request)
 #define ADI_RX_COUNTER_IOC_CONFIGURE_SCAN \
 	_IOW('T', 0x21, struct adi_rx_counter_scan_config)
@@ -97,4 +110,6 @@ struct adi_rx_counter_scan_release {
 	_IOR('T', 0x23, struct adi_rx_counter_scan_caps)
 #define ADI_RX_COUNTER_IOC_RELEASE_SCAN \
 	_IOWR('T', 0x24, struct adi_rx_counter_scan_release)
+#define ADI_RX_COUNTER_IOC_SCAN_SNAPSHOT \
+	_IOWR('T', 0x25, struct adi_rx_counter_scan_snapshot)
 #endif

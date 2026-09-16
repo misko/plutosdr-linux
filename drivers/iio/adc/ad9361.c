@@ -2491,6 +2491,28 @@ out:
 }
 EXPORT_SYMBOL_GPL(ad9361_counter_fastlock_recall);
 
+int ad9361_counter_snapshot(struct ad9361_rf_phy *phy, void *owner,
+			    u32 *counter)
+{
+	struct axiadc_converter *conv = spi_get_drvdata(phy->spi);
+	struct axiadc_state *adc;
+	int ret = 0;
+
+	if (!conv || !conv->indio_dev || !owner || !counter)
+		return -EINVAL;
+	adc = iio_priv(conv->indio_dev);
+	mutex_lock(&conv->lock);
+	mutex_lock(&phy->lock);
+	if (!phy->counter_owned || phy->tandem_owner != owner)
+		ret = -EPERM;
+	else
+		*counter = axiadc_read(adc, ADI_REG_GP_STATUS);
+	mutex_unlock(&phy->lock);
+	mutex_unlock(&conv->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ad9361_counter_snapshot);
+
 static int __ad9361_counter_release(struct ad9361_rf_phy *phy, void *owner,
 				    u64 *frequency_hz, u32 *counter_before,
 				    u32 *counter_after)

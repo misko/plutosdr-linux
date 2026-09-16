@@ -537,6 +537,7 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 	struct adi_rx_counter_scan_recall recall;
 	struct adi_rx_counter_scan_caps scan_caps;
 	struct adi_rx_counter_scan_release scan_release;
+	struct adi_rx_counter_scan_snapshot scan_snapshot;
 	u64 scan_frequency[ADI_RX_COUNTER_SCAN_MAX_PROFILES];
 	u32 scan_crc[ADI_RX_COUNTER_SCAN_MAX_PROFILES];
 	unsigned int i;
@@ -547,7 +548,8 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 	    cmd != ADI_RX_COUNTER_IOC_CONFIGURE_SCAN &&
 	    cmd != ADI_RX_COUNTER_IOC_RECALL &&
 	    cmd != ADI_RX_COUNTER_IOC_GET_SCAN_CAPS &&
-	    cmd != ADI_RX_COUNTER_IOC_RELEASE_SCAN) {
+	    cmd != ADI_RX_COUNTER_IOC_RELEASE_SCAN &&
+	    cmd != ADI_RX_COUNTER_IOC_SCAN_SNAPSHOT) {
 		ret = -EBUSY;
 		goto out_ioctl;
 	}
@@ -687,6 +689,31 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 			if (copy_to_user(argp, &scan_release, sizeof(scan_release)))
 				ret = -EFAULT;
 		}
+		break;
+	case ADI_RX_COUNTER_IOC_SCAN_SNAPSHOT:
+		if (!st->counter_acquired) {
+			ret = -ENODATA;
+			break;
+		}
+		if (copy_from_user(&scan_snapshot, argp,
+				   sizeof(scan_snapshot))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (scan_snapshot.magic != ADI_RX_COUNTER_MAGIC ||
+		    scan_snapshot.version != ADI_RX_COUNTER_SCAN_VERSION ||
+		    scan_snapshot.size != sizeof(scan_snapshot) ||
+		    scan_snapshot.flags || scan_snapshot.counter ||
+		    scan_snapshot.reserved[0] || scan_snapshot.reserved[1] ||
+		    scan_snapshot.reserved[2] || scan_snapshot.reserved[3]) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = ad9361_counter_snapshot(st->phy, st,
+					      &scan_snapshot.counter);
+		if (!ret && copy_to_user(argp, &scan_snapshot,
+					 sizeof(scan_snapshot)))
+			ret = -EFAULT;
 		break;
 	case ADI_TANDEM_AGC_IOC_GET_CAPS:
 		memset(&caps, 0, sizeof(caps));
