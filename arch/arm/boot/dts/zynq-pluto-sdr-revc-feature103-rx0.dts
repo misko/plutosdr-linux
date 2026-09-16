@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Volatile qualification topology for firmware feature request #103.
+ *
+ * The adaptive-scan counter contract is deliberately limited to one physical
+ * receive stream.  Include the ordinary Rev.C description, then narrow the
+ * AD9361 interface to the first RX/TX pair.  This file is for the RAM-only
+ * qualification FIT; it does not alter the installed device tree or U-Boot
+ * environment.
+ */
+#include "zynq-pluto-sdr-revc.dts"
+
+&adc0_ad9364 {
+	/delete-property/ adi,2rx-2tx-mode-enable;
+	adi,1rx-1tx-mode-use-rx-num = <1>;
+	adi,1rx-1tx-mode-use-tx-num = <1>;
+};
+
+&cf_ad9364_dac_core_0 {
+	compatible = "adi,axi-ad9364-dds-6.00.a";
+};

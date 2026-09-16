@@ -649,6 +649,10 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 		}
 		break;
 	case ADI_RX_COUNTER_IOC_GET_SCAN_CAPS:
+		if (!ad9361_counter_topology_supported(st->phy)) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
 		memset(&scan_caps, 0, sizeof(scan_caps));
 		scan_caps.magic = ADI_RX_COUNTER_MAGIC;
 		scan_caps.version = ADI_RX_COUNTER_SCAN_VERSION;
