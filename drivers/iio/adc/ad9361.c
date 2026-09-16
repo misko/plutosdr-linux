@@ -2247,6 +2247,20 @@ static int ad9361_fastlock_save(struct ad9361_rf_phy *phy, bool tx,
 				u32 profile, u8 *values);
 static int ad9361_fastlock_prepare(struct ad9361_rf_phy *phy, bool tx,
 				   u32 profile, bool prepare);
+static unsigned long ad9361_rfpll_recalc_rate(struct clk_hw *hw, unsigned long parent_rate);
+
+static u64 ad9361_counter_live_rx_lo(struct ad9361_rf_phy *phy)
+{
+	struct clk *clock = phy->clks[RX_RFPLL_INT];
+	unsigned long parent_rate = clk_get_rate(clk_get_parent(clock));
+
+	/* Fast Lock writes RFPLL registers directly, so clk_get_rate(RX_RFPLL)
+	 * remains cached at the last ordinary LO write. Force the driver's
+	 * register-backed recalc path for frequency attestation.
+	 */
+	return ad9361_from_clk(ad9361_rfpll_recalc_rate(__clk_get_hw(clock),
+						       parent_rate));
+}
 
 static int ad9361_counter_profile_crc(struct ad9361_rf_phy *phy, u32 profile,
 				      u32 *crc)
@@ -2393,7 +2407,7 @@ int ad9361_counter_configure_scan(struct ad9361_rf_phy *phy, void *owner,
 		ret = ad9361_fastlock_recall(phy, false, i);
 		if (ret)
 			break;
-		actual = ad9361_from_clk(clk_get_rate(phy->clks[RX_RFPLL]));
+		actual = ad9361_counter_live_rx_lo(phy);
 		if (!ad9361_counter_frequency_matches(actual, frequency_hz[i])) {
 			ret = -ERANGE;
 			break;
@@ -2464,7 +2478,7 @@ int ad9361_counter_fastlock_recall(struct ad9361_rf_phy *phy, void *owner,
 	*counter_after = axiadc_read(adc, ADI_REG_GP_STATUS);
 	if (ret)
 		goto fault_restore;
-	actual = ad9361_from_clk(clk_get_rate(phy->clks[RX_RFPLL]));
+	actual = ad9361_counter_live_rx_lo(phy);
 	if (!ad9361_counter_frequency_matches(actual,
 					      phy->counter_scan_frequency_hz[profile])) {
 		ret = -EIO;
