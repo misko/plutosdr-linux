@@ -2491,10 +2491,13 @@ out:
 }
 EXPORT_SYMBOL_GPL(ad9361_counter_fastlock_recall);
 
-int ad9361_counter_release(struct ad9361_rf_phy *phy, void *owner)
+static int __ad9361_counter_release(struct ad9361_rf_phy *phy, void *owner,
+				    u64 *frequency_hz, u32 *counter_before,
+				    u32 *counter_after)
 {
 	struct axiadc_converter *conv = spi_get_drvdata(phy->spi);
 	struct axiadc_state *adc = iio_priv(conv->indio_dev);
+	u64 actual;
 	int ret = 0;
 	mutex_lock(&conv->lock);
 	mutex_lock(&phy->lock);
@@ -2502,6 +2505,8 @@ int ad9361_counter_release(struct ad9361_rf_phy *phy, void *owner)
 		ret = -EPERM;
 		goto out;
 	}
+	if (counter_before)
+		*counter_before = axiadc_read(adc, ADI_REG_GP_STATUS);
 	if (phy->counter_scan_restore_required ||
 	    phy->state->fastlock.current_profile[0]) {
 		ret = ad9361_counter_restore_rx_lo(phy);
@@ -2519,12 +2524,33 @@ int ad9361_counter_release(struct ad9361_rf_phy *phy, void *owner)
 	phy->counter_scan_profile_mask = 0;
 	phy->counter_owned = false;
 	phy->tandem_owner = NULL;
+	actual = ad9361_from_clk(clk_get_rate(phy->clks[RX_RFPLL]));
+	if (frequency_hz)
+		*frequency_hz = actual;
+	if (counter_after)
+		*counter_after = axiadc_read(adc, ADI_REG_GP_STATUS);
 out:
 	mutex_unlock(&phy->lock);
 	mutex_unlock(&conv->lock);
 	return ret;
 }
+
+int ad9361_counter_release(struct ad9361_rf_phy *phy, void *owner)
+{
+	return __ad9361_counter_release(phy, owner, NULL, NULL, NULL);
+}
 EXPORT_SYMBOL_GPL(ad9361_counter_release);
+
+int ad9361_counter_release_receipt(struct ad9361_rf_phy *phy, void *owner,
+				   u64 *frequency_hz, u32 *counter_before,
+				   u32 *counter_after)
+{
+	if (!frequency_hz || !counter_before || !counter_after)
+		return -EINVAL;
+	return __ad9361_counter_release(phy, owner, frequency_hz, counter_before,
+					counter_after);
+}
+EXPORT_SYMBOL_GPL(ad9361_counter_release_receipt);
 
 int ad9361_tandem_prepare(struct ad9361_rf_phy *phy, void *owner,
 			  const struct ad9361_tandem_config *config,

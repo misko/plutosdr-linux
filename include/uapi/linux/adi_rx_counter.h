@@ -76,6 +76,18 @@ struct adi_rx_counter_scan_caps {
 	__u32 reserved[2];
 };
 
+struct adi_rx_counter_scan_release {
+	__u32 magic;
+	__u16 version;
+	__u16 size;
+	__u32 flags;
+	__u32 reserved0;
+	__aligned_u64 frequency_hz;
+	__u32 counter_before;
+	__u32 counter_after;
+	__u32 reserved[4];
+};
+
 #define ADI_RX_COUNTER_IOC_ACQUIRE _IOW('T', 0x20, struct adi_rx_counter_request)
 #define ADI_RX_COUNTER_IOC_CONFIGURE_SCAN \
 	_IOW('T', 0x21, struct adi_rx_counter_scan_config)
@@ -83,4 +95,6 @@ struct adi_rx_counter_scan_caps {
 	_IOWR('T', 0x22, struct adi_rx_counter_scan_recall)
 #define ADI_RX_COUNTER_IOC_GET_SCAN_CAPS \
 	_IOR('T', 0x23, struct adi_rx_counter_scan_caps)
+#define ADI_RX_COUNTER_IOC_RELEASE_SCAN \
+	_IOWR('T', 0x24, struct adi_rx_counter_scan_release)
 #endif

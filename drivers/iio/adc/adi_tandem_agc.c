@@ -536,6 +536,7 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 	struct adi_rx_counter_scan_config scan_config;
 	struct adi_rx_counter_scan_recall recall;
 	struct adi_rx_counter_scan_caps scan_caps;
+	struct adi_rx_counter_scan_release scan_release;
 	u64 scan_frequency[ADI_RX_COUNTER_SCAN_MAX_PROFILES];
 	u32 scan_crc[ADI_RX_COUNTER_SCAN_MAX_PROFILES];
 	unsigned int i;
@@ -545,7 +546,8 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 	if (st->counter_acquired && cmd != ADI_TANDEM_AGC_IOC_RELEASE &&
 	    cmd != ADI_RX_COUNTER_IOC_CONFIGURE_SCAN &&
 	    cmd != ADI_RX_COUNTER_IOC_RECALL &&
-	    cmd != ADI_RX_COUNTER_IOC_GET_SCAN_CAPS) {
+	    cmd != ADI_RX_COUNTER_IOC_GET_SCAN_CAPS &&
+	    cmd != ADI_RX_COUNTER_IOC_RELEASE_SCAN) {
 		ret = -EBUSY;
 		goto out_ioctl;
 	}
@@ -655,6 +657,36 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 		scan_caps.frequency_resolution_hz = 2;
 		if (copy_to_user(argp, &scan_caps, sizeof(scan_caps)))
 			ret = -EFAULT;
+		break;
+	case ADI_RX_COUNTER_IOC_RELEASE_SCAN:
+		if (!st->counter_acquired) {
+			ret = -ENODATA;
+			break;
+		}
+		if (copy_from_user(&scan_release, argp, sizeof(scan_release))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (scan_release.magic != ADI_RX_COUNTER_MAGIC ||
+		    scan_release.version != ADI_RX_COUNTER_SCAN_VERSION ||
+		    scan_release.size != sizeof(scan_release) ||
+		    scan_release.flags || scan_release.reserved0 ||
+		    scan_release.frequency_hz || scan_release.counter_before ||
+		    scan_release.counter_after || scan_release.reserved[0] ||
+		    scan_release.reserved[1] || scan_release.reserved[2] ||
+		    scan_release.reserved[3]) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = ad9361_counter_release_receipt(st->phy, st,
+						     &scan_release.frequency_hz,
+						     &scan_release.counter_before,
+						     &scan_release.counter_after);
+		if (!ret) {
+			st->counter_acquired = false;
+			if (copy_to_user(argp, &scan_release, sizeof(scan_release)))
+				ret = -EFAULT;
+		}
 		break;
 	case ADI_TANDEM_AGC_IOC_GET_CAPS:
 		memset(&caps, 0, sizeof(caps));

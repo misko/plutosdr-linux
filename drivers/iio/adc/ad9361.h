@@ -226,6 +226,9 @@ bool ad9361_counter_topology_supported(struct ad9361_rf_phy *phy);
 int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_rate_hz,
 			   u32 samples_per_channel);
 int ad9361_counter_release(struct ad9361_rf_phy *phy, void *owner);
+int ad9361_counter_release_receipt(struct ad9361_rf_phy *phy, void *owner,
+				   u64 *frequency_hz, u32 *counter_before,
+				   u32 *counter_after);
 int ad9361_counter_configure_scan(struct ad9361_rf_phy *phy, void *owner,
 				  u32 profile_mask, const u64 *frequency_hz,
 				  const u32 *profile_crc);
