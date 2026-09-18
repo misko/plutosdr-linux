@@ -19,6 +19,7 @@
 #include <linux/debugfs.h>
 #include <linux/uaccess.h>
 #include <linux/firmware.h>
+#include <uapi/linux/adi_rx_counter.h>
 
 #include <linux/of.h>
 #include <linux/of_gpio.h>
@@ -2303,13 +2304,15 @@ static int ad9361_counter_restore_rx_lo(struct ad9361_rf_phy *phy)
 
 bool ad9361_counter_topology_supported(struct ad9361_rf_phy *phy)
 {
-	return spi_get_device_id(phy->spi)->driver_data == ID_AD9361 && !phy->pdata->rx2tx2 &&
-	       phy->pdata->rx1tx1_mode_use_rx_num == 1;
+	/* The counter is clocked from RX1 and the FPGA packs either its I/Q pair
+	 * or the synchronous RX1/RX2 frame.  Both are native AD9361 topologies. */
+	return spi_get_device_id(phy->spi)->driver_data == ID_AD9361 &&
+		(phy->pdata->rx2tx2 || phy->pdata->rx1tx1_mode_use_rx_num == 1);
 }
 EXPORT_SYMBOL_GPL(ad9361_counter_topology_supported);
 
 int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_rate_hz,
-			   u32 samples_per_channel)
+			   u32 samples_per_channel, u32 scan_mask)
 {
 	struct axiadc_converter *conv = spi_get_drvdata(phy->spi);
 	struct axiadc_state *adc;
@@ -2317,6 +2320,9 @@ int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_ra
 	u32 control;
 	if (!conv || !conv->indio_dev || !owner || !samples_per_channel ||
 	    (samples_per_channel & 1) || samples_per_channel > 0x7ffffffeU)
+		return -EINVAL;
+	if (scan_mask != ADI_RX_COUNTER_SCAN_MASK_RX1 &&
+	    scan_mask != ADI_RX_COUNTER_SCAN_MASK_RX1_RX2)
 		return -EINVAL;
 	adc = iio_priv(conv->indio_dev);
 	mutex_lock(&conv->indio_dev->mlock);
@@ -2326,7 +2332,11 @@ int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_ra
 		ret = -EBUSY;
 		goto out;
 	}
-	if (!ad9361_counter_topology_supported(phy) || phy->state->agc_mode[0] != RF_GAIN_MGC ||
+	if (!ad9361_counter_topology_supported(phy) ||
+	    (scan_mask == ADI_RX_COUNTER_SCAN_MASK_RX1_RX2 && !phy->pdata->rx2tx2) ||
+	    phy->state->agc_mode[0] != RF_GAIN_MGC ||
+	    (scan_mask == ADI_RX_COUNTER_SCAN_MASK_RX1_RX2 &&
+	     phy->state->agc_mode[1] != RF_GAIN_MGC) ||
 	    phy->state->fastlock.current_profile[0] ||
 	    clk_get_rate(phy->clks[RX_SAMPL_CLK]) != sample_rate_hz) {
 		ret = -EOPNOTSUPP;
@@ -2341,18 +2351,22 @@ int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_ra
 	phy->counter_previous_rx_lo_hz =
 		ad9361_from_clk(clk_get_rate(phy->clks[RX_RFPLL]));
 	phy->counter_scan_profile_mask = 0;
+	phy->counter_scan_mask = scan_mask;
 	phy->counter_scan_configured = false;
 	phy->counter_scan_restore_required = false;
 	phy->tandem_owner = owner;
 	phy->counter_owned = true;
 	conv->counter_capture_owned = true;
-	/* Four bytes per complex sample, one timestamp per packed IQ frame. */
+	conv->counter_capture_scan_mask = scan_mask;
+	/* One timestamp per packed IQ frame; a paired frame has two CI16 values. */
 	axiadc_write(adc, ADI_REG_GP_CONTROL, samples_per_channel);
 	if (axiadc_read(adc, ADI_REG_GP_CONTROL) != samples_per_channel) {
 		axiadc_write(adc, ADI_REG_GP_CONTROL, control);
 		phy->tandem_owner = NULL;
 		phy->counter_owned = false;
 		conv->counter_capture_owned = false;
+		conv->counter_capture_scan_mask = 0;
+		phy->counter_scan_mask = 0;
 		ret = -EIO;
 	}
 out:
@@ -2555,10 +2569,12 @@ static int __ad9361_counter_release(struct ad9361_rf_phy *phy, void *owner,
 		goto out;
 	}
 	conv->counter_capture_owned = false;
+	conv->counter_capture_scan_mask = 0;
 	phy->counter_scan_configured = false;
 	phy->counter_scan_restore_required = false;
 	phy->counter_scan_profile_mask = 0;
 	phy->counter_owned = false;
+	phy->counter_scan_mask = 0;
 	phy->tandem_owner = NULL;
 	actual = ad9361_from_clk(clk_get_rate(phy->clks[RX_RFPLL]));
 	if (frequency_hz)

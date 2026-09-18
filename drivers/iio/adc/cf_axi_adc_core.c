@@ -799,7 +799,8 @@ static int axiadc_update_scan_mode(struct iio_dev *indio_dev,
 	struct axiadc_state *st = iio_priv(indio_dev);
 	unsigned i, ctrl;
 	struct axiadc_converter *conv = to_converter(st->dev_spi);
-	if (conv->counter_capture_owned && (indio_dev->masklength != 2 || scan_mask[0] != 3))
+	if (conv->counter_capture_owned &&
+	    scan_mask[0] != conv->counter_capture_scan_mask)
 		return -EBUSY;
 
 	for (i = 0; i < indio_dev->masklength; i++) {

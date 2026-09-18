@@ -10,6 +10,10 @@
 #define ADI_RX_COUNTER_SCAN_VERSION 1U
 #define ADI_RX_COUNTER_SCAN_MAX_PROFILES 8U
 #define ADI_RX_COUNTER_SCAN_FEATURES 0x1fU
+/* IIO scan-mask values.  A counter tick is one sample instant, irrespective
+ * of whether that instant contains RX1 alone or the paired RX1/RX2 frame. */
+#define ADI_RX_COUNTER_SCAN_MASK_RX1 0x03U
+#define ADI_RX_COUNTER_SCAN_MASK_RX1_RX2 0x0fU
 struct adi_rx_counter_request {
 	__u32 magic;
 	__u16 version;

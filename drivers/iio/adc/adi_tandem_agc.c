@@ -562,7 +562,9 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 		if (counter.magic != ADI_RX_COUNTER_MAGIC ||
 		    counter.version != ADI_RX_COUNTER_VERSION || counter.size != sizeof(counter) ||
 		    counter.required_features != ADI_RX_COUNTER_FEATURES ||
-		    counter.scan_mask != 3 || counter.reserved[0] || counter.reserved[1]) {
+		    (counter.scan_mask != ADI_RX_COUNTER_SCAN_MASK_RX1 &&
+		     counter.scan_mask != ADI_RX_COUNTER_SCAN_MASK_RX1_RX2) ||
+		    counter.reserved[0] || counter.reserved[1]) {
 			ret = -EINVAL;
 			break;
 		}
@@ -571,7 +573,7 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 			break;
 		}
 		ret = ad9361_counter_acquire(st->phy, st, counter.sample_rate_hz,
-					     counter.samples_per_channel);
+					     counter.samples_per_channel, counter.scan_mask);
 		if (!ret)
 			st->counter_acquired = true;
 		break;
