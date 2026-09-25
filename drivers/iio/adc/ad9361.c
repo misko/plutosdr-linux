@@ -2311,6 +2311,14 @@ bool ad9361_counter_topology_supported(struct ad9361_rf_phy *phy)
 }
 EXPORT_SYMBOL_GPL(ad9361_counter_topology_supported);
 
+static bool ad9361_counter_gain_mode_supported(u8 mode)
+{
+	/* Counter ownership blocks software gain/mode writes.  Slow attack is
+	 * autonomous in the transceiver and does not conflict with that lease.
+	 */
+	return mode == RF_GAIN_MGC || mode == RF_GAIN_SLOWATTACK_AGC;
+}
+
 int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_rate_hz,
 			   u32 samples_per_channel, u32 scan_mask)
 {
@@ -2333,12 +2341,34 @@ int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_ra
 		goto out;
 	}
 	if (!ad9361_counter_topology_supported(phy) ||
-	    (scan_mask == ADI_RX_COUNTER_SCAN_MASK_RX1_RX2 && !phy->pdata->rx2tx2) ||
-	    phy->state->agc_mode[0] != RF_GAIN_MGC ||
+	    (scan_mask == ADI_RX_COUNTER_SCAN_MASK_RX1_RX2 && !phy->pdata->rx2tx2)) {
+		dev_warn(&phy->spi->dev,
+			 "counter acquire rejected: topology scan_mask=0x%x rx2tx2=%u\n",
+			 scan_mask, phy->pdata->rx2tx2);
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	if (!ad9361_counter_gain_mode_supported(phy->state->agc_mode[0]) ||
 	    (scan_mask == ADI_RX_COUNTER_SCAN_MASK_RX1_RX2 &&
-	     phy->state->agc_mode[1] != RF_GAIN_MGC) ||
-	    phy->state->fastlock.current_profile[0] ||
-	    clk_get_rate(phy->clks[RX_SAMPL_CLK]) != sample_rate_hz) {
+	     (phy->state->agc_mode[1] != phy->state->agc_mode[0] ||
+	      !ad9361_counter_gain_mode_supported(phy->state->agc_mode[1])))) {
+		dev_warn(&phy->spi->dev,
+			 "counter acquire rejected: gain modes rx1=%u rx2=%u scan_mask=0x%x\n",
+			 phy->state->agc_mode[0], phy->state->agc_mode[1], scan_mask);
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	if (phy->state->fastlock.current_profile[0]) {
+		dev_warn(&phy->spi->dev,
+			 "counter acquire rejected: active Fast Lock profile=%u\n",
+			 phy->state->fastlock.current_profile[0]);
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	if (clk_get_rate(phy->clks[RX_SAMPL_CLK]) != sample_rate_hz) {
+		dev_warn(&phy->spi->dev,
+			 "counter acquire rejected: sample rate requested=%u observed=%lu\n",
+			 sample_rate_hz, clk_get_rate(phy->clks[RX_SAMPL_CLK]));
 		ret = -EOPNOTSUPP;
 		goto out;
 	}
