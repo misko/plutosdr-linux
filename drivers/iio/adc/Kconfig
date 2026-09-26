@@ -479,6 +479,14 @@ config AD9361
 	  AD9361, AD9364 RF Agile Transceivers. Provides direct access
 	  via sysfs.
 
+config AD9361_COUNTER_KUNIT_TEST
+	tristate "AD9361 counter interval KUnit test" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Tests the packed-word timestamp interval used by single- and dual-RX
+	  counter captures.
+
 config AD9361_EXT_BAND_CONTROL
 	bool "Support for controlling RX/TX band selection by the driver"
 	depends on AD9361

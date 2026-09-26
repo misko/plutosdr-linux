@@ -38,6 +38,7 @@
 #define IIO_AD9361_USE_PRIVATE_H_
 
 #include "ad9361.h"
+#include "ad9361-counter.h"
 #include "ad9361_private.h"
 #include "cf_axi_adc.h"
 
@@ -2326,12 +2327,12 @@ int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_ra
 	struct axiadc_state *adc;
 	int ret = 0;
 	u32 control, timestamp_control;
-	if (!conv || !conv->indio_dev || !owner || !samples_per_channel ||
-	    (samples_per_channel & 1) || samples_per_channel > 0x7ffffffeU)
+	if (!conv || !conv->indio_dev || !owner)
 		return -EINVAL;
-	if (scan_mask != ADI_RX_COUNTER_SCAN_MASK_RX1 &&
-	    scan_mask != ADI_RX_COUNTER_SCAN_MASK_RX1_RX2)
-		return -EINVAL;
+	ret = ad9361_counter_timestamp_control(samples_per_channel, scan_mask,
+					       &timestamp_control);
+	if (ret)
+		return ret;
 	adc = iio_priv(conv->indio_dev);
 	mutex_lock(&conv->indio_dev->mlock);
 	mutex_lock(&conv->lock);
@@ -2394,9 +2395,6 @@ int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_ra
 	 * dual-RX interval must be twice the per-channel sample count.  Programming
 	 * the single-RX value for a paired capture inserts a second timestamp in
 	 * the IQ payload halfway through every DMA block. */
-	timestamp_control = samples_per_channel;
-	if (scan_mask == ADI_RX_COUNTER_SCAN_MASK_RX1_RX2)
-		timestamp_control *= 2U;
 	axiadc_write(adc, ADI_REG_GP_CONTROL, timestamp_control);
 	if (axiadc_read(adc, ADI_REG_GP_CONTROL) != timestamp_control) {
 		axiadc_write(adc, ADI_REG_GP_CONTROL, control);
