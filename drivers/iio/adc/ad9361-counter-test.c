@@ -12,10 +12,13 @@ static void ad9361_counter_interval_layout_test(struct kunit *test)
 		ad9361_counter_timestamp_control(1000000,
 			ADI_RX_COUNTER_SCAN_MASK_RX1, &control));
 	KUNIT_EXPECT_EQ(test, 1000000U, control);
+	KUNIT_EXPECT_EQ(test, 500000U, control >> 1);
 	KUNIT_EXPECT_EQ(test, 0,
 		ad9361_counter_timestamp_control(1000000,
 			ADI_RX_COUNTER_SCAN_MASK_RX1_RX2, &control));
 	KUNIT_EXPECT_EQ(test, 2000000U, control);
+	/* GP_CONTROL[31:1] is the interval presented to the FPGA. */
+	KUNIT_EXPECT_EQ(test, 1000000U, control >> 1);
 }
 
 static void ad9361_counter_interval_bounds_test(struct kunit *test)
