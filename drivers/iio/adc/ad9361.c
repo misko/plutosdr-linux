@@ -2325,7 +2325,7 @@ int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_ra
 	struct axiadc_converter *conv = spi_get_drvdata(phy->spi);
 	struct axiadc_state *adc;
 	int ret = 0;
-	u32 control;
+	u32 control, timestamp_control;
 	if (!conv || !conv->indio_dev || !owner || !samples_per_channel ||
 	    (samples_per_channel & 1) || samples_per_channel > 0x7ffffffeU)
 		return -EINVAL;
@@ -2388,9 +2388,17 @@ int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_ra
 	phy->counter_owned = true;
 	conv->counter_capture_owned = true;
 	conv->counter_capture_scan_mask = scan_mask;
-	/* One timestamp per packed IQ frame; a paired frame has two CI16 values. */
-	axiadc_write(adc, ADI_REG_GP_CONTROL, samples_per_channel);
-	if (axiadc_read(adc, ADI_REG_GP_CONTROL) != samples_per_channel) {
+	/* GP_CONTROL[31:1] counts packed 64-bit DMA words.  A single-RX word
+	 * contains two CI16 samples, while a dual-RX word contains one sample from
+	 * each receiver.  The register value is shifted right by the FPGA, so the
+	 * dual-RX interval must be twice the per-channel sample count.  Programming
+	 * the single-RX value for a paired capture inserts a second timestamp in
+	 * the IQ payload halfway through every DMA block. */
+	timestamp_control = samples_per_channel;
+	if (scan_mask == ADI_RX_COUNTER_SCAN_MASK_RX1_RX2)
+		timestamp_control *= 2U;
+	axiadc_write(adc, ADI_REG_GP_CONTROL, timestamp_control);
+	if (axiadc_read(adc, ADI_REG_GP_CONTROL) != timestamp_control) {
 		axiadc_write(adc, ADI_REG_GP_CONTROL, control);
 		phy->tandem_owner = NULL;
 		phy->counter_owned = false;
