@@ -15,6 +15,7 @@
 #include <linux/err.h>
 #include <linux/delay.h>
 #include <linux/io.h>
+#include <linux/ktime.h>
 #include <linux/string.h>
 #include <linux/debugfs.h>
 #include <linux/uaccess.h>
@@ -2251,17 +2252,92 @@ static int ad9361_fastlock_prepare(struct ad9361_rf_phy *phy, bool tx,
 				   u32 profile, bool prepare);
 static unsigned long ad9361_rfpll_recalc_rate(struct clk_hw *hw, unsigned long parent_rate);
 
-static u64 ad9361_counter_live_rx_lo(struct ad9361_rf_phy *phy)
+/* Bound scan attestation independently of the general calibration timeout.
+ * SPI failures are errors, never status bits. The PHY lock excludes retuning.
+ */
+static int ad9361_counter_wait_rx_lock(struct ad9361_rf_phy *phy)
+{
+	ktime_t deadline = ktime_add_us(ktime_get(), 2000);
+	int status;
+
+	for (;;) {
+		status = ad9361_spi_read(phy->spi, REG_RX_CP_OVERRANGE_VCO_LOCK);
+		if (status < 0)
+			return status;
+		if (ktime_compare(ktime_get(), deadline) > 0)
+			return -ETIMEDOUT;
+		if (status & VCO_LOCK)
+			return 0;
+		usleep_range(20, 40);
+	}
+}
+
+static int ad9361_fastlock_readval(struct spi_device *spi, bool tx,
+				 u32 profile, u32 word);
+static u64 ad9361_calc_rfpll_freq(u64 parent_rate, u64 integer,
+				 u64 fract, u32 vco_div);
+
+/* The ordinary RFPLL SPI registers retain the last conventional tune while
+ * Fast Lock is active. They are NOT a live-frequency oracle in that mode.
+ * Check the hardware selector, not just current_profile in software, and
+ * propagate every profile read error before decoding its configured frequency.
+ * Lock status is independent evidence, but neither check measures the RF LO.
+ */
+static int ad9361_counter_profile_rx_lo(struct ad9361_rf_phy *phy,
+				      u32 profile, u64 *frequency)
 {
 	struct clk *clock = phy->clks[RX_RFPLL_INT];
-	unsigned long parent_rate = clk_get_rate(clk_get_parent(clock));
+	u8 buf[5];
+	u32 integer, fract;
+	int i, ret, divider;
 
-	/* Fast Lock writes RFPLL registers directly, so clk_get_rate(RX_RFPLL)
-	 * remains cached at the last ordinary LO write. Force the driver's
-	 * register-backed recalc path for frequency attestation.
-	 */
-	return ad9361_from_clk(ad9361_rfpll_recalc_rate(__clk_get_hw(clock),
-						       parent_rate));
+	ret = ad9361_spi_read(phy->spi, REG_RX_FAST_LOCK_SETUP);
+	if (ret < 0)
+		return ret;
+	if ((ret & (RX_FAST_LOCK_PROFILE(~0) |
+		    RX_FAST_LOCK_PROFILE_PIN_SELECT | RX_FAST_LOCK_MODE_ENABLE)) !=
+	    (RX_FAST_LOCK_PROFILE(profile) | RX_FAST_LOCK_MODE_ENABLE))
+		return -EIO;
+	for (i = 0; i < ARRAY_SIZE(buf); i++) {
+		ret = ad9361_fastlock_readval(phy->spi, false, profile, 4 - i);
+		if (ret < 0)
+			return ret;
+		buf[i] = ret;
+	}
+	divider = ad9361_fastlock_readval(phy->spi, false, profile, 12);
+	if (divider < 0)
+		return divider;
+	fract = (SYNTH_FRACT_WORD(buf[0]) << 16) | (buf[1] << 8) | buf[2];
+	integer = (SYNTH_INTEGER_WORD(buf[3]) << 8) | buf[4];
+	*frequency = ad9361_calc_rfpll_freq(clk_get_rate(clk_get_parent(clock)),
+					  integer, fract, divider & 0xf);
+	return 0;
+}
+
+/* Only valid outside Fast Lock, for restoration verification. */
+static int ad9361_counter_read_rx_lo(struct ad9361_rf_phy *phy, u64 *frequency)
+{
+	struct clk *clock = phy->clks[RX_RFPLL_INT];
+	u8 buf[5];
+	u32 integer, fract;
+	int ret, divider;
+
+	ret = ad9361_spi_read(phy->spi, REG_RX_FAST_LOCK_SETUP);
+	if (ret < 0)
+		return ret;
+	if (ret & RX_FAST_LOCK_MODE_ENABLE)
+		return -EIO;
+	ret = ad9361_spi_readm(phy->spi, REG_RX_FRACT_BYTE_2, buf, sizeof(buf));
+	if (ret < 0)
+		return ret;
+	divider = ad9361_spi_read(phy->spi, REG_RFPLL_DIVIDERS);
+	if (divider < 0)
+		return divider;
+	fract = (SYNTH_FRACT_WORD(buf[0]) << 16) | (buf[1] << 8) | buf[2];
+	integer = (SYNTH_INTEGER_WORD(buf[3]) << 8) | buf[4];
+	*frequency = ad9361_calc_rfpll_freq(clk_get_rate(clk_get_parent(clock)),
+					  integer, fract, RX_VCO_DIVIDER(divider));
+	return 0;
 }
 
 static int ad9361_counter_profile_crc(struct ad9361_rf_phy *phy, u32 profile,
@@ -2295,7 +2371,12 @@ static int ad9361_counter_restore_rx_lo(struct ad9361_rf_phy *phy)
 			   ad9361_to_clk(phy->counter_previous_rx_lo_hz));
 	if (ret)
 		return ret;
-	actual = ad9361_from_clk(clk_get_rate(phy->clks[RX_RFPLL]));
+	ret = ad9361_counter_read_rx_lo(phy, &actual);
+	if (ret)
+		return ret;
+	ret = ad9361_counter_wait_rx_lock(phy);
+	if (ret)
+		return ret;
 	if (!ad9361_counter_frequency_matches(actual,
 					      phy->counter_previous_rx_lo_hz))
 		return -EIO;
@@ -2457,7 +2538,12 @@ int ad9361_counter_configure_scan(struct ad9361_rf_phy *phy, void *owner,
 		ret = ad9361_fastlock_recall(phy, false, i);
 		if (ret)
 			break;
-		actual = ad9361_counter_live_rx_lo(phy);
+		ret = ad9361_counter_wait_rx_lock(phy);
+		if (ret)
+			break;
+		ret = ad9361_counter_profile_rx_lo(phy, i, &actual);
+		if (ret)
+			break;
 		if (!ad9361_counter_frequency_matches(actual, frequency_hz[i])) {
 			ret = -ERANGE;
 			break;
@@ -2525,10 +2611,14 @@ int ad9361_counter_fastlock_recall(struct ad9361_rf_phy *phy, void *owner,
 	*counter_before = axiadc_read(adc, ADI_REG_GP_STATUS);
 	phy->counter_scan_restore_required = true;
 	ret = ad9361_fastlock_recall(phy, false, profile);
-	*counter_after = axiadc_read(adc, ADI_REG_GP_STATUS);
 	if (ret)
 		goto fault_restore;
-	actual = ad9361_counter_live_rx_lo(phy);
+	ret = ad9361_counter_wait_rx_lock(phy);
+	if (ret)
+		goto fault_restore;
+	ret = ad9361_counter_profile_rx_lo(phy, profile, &actual);
+	if (ret)
+		goto fault_restore;
 	if (!ad9361_counter_frequency_matches(actual,
 					      phy->counter_scan_frequency_hz[profile])) {
 		ret = -EIO;
@@ -2537,6 +2627,7 @@ int ad9361_counter_fastlock_recall(struct ad9361_rf_phy *phy, void *owner,
 	ret = ad9361_counter_profile_crc(phy, profile, &crc);
 	if (ret)
 		goto fault_restore;
+	*counter_after = axiadc_read(adc, ADI_REG_GP_STATUS);
 	phy->counter_scan_profile_crc[profile] = crc;
 	*frequency_hz = actual;
 	*profile_crc = crc;
@@ -5310,6 +5401,7 @@ static int ad9361_fastlock_prepare(struct ad9361_rf_phy *phy, bool tx,
 	struct ad9361_rf_phy_state *st = phy->state;
 	u32 offs, ready_mask;
 	bool is_prepared;
+	int ret = 0, err;
 
 	dev_dbg(&phy->spi->dev, "%s: %s Profile %d: %s",
 		__func__, tx ? "TX" : "RX", profile,
@@ -5326,34 +5418,61 @@ static int ad9361_fastlock_prepare(struct ad9361_rf_phy *phy, bool tx,
 	is_prepared = !!st->fastlock.current_profile[tx];
 
 	if (prepare && !is_prepared) {
-		ad9361_spi_write(phy->spi,
+		/* A partial setup must still be unwound by the scan fault path. */
+		st->fastlock.current_profile[tx] = profile + 1;
+		err = ad9361_spi_write(phy->spi,
 				REG_RX_FAST_LOCK_SETUP_INIT_DELAY + offs,
 				(tx ? phy->pdata->tx_fastlock_delay_ns :
 				phy->pdata->rx_fastlock_delay_ns) / 250);
-		ad9361_spi_write(phy->spi, REG_RX_FAST_LOCK_SETUP + offs,
+		if (err && !ret)
+			ret = err;
+		err = ad9361_spi_write(phy->spi, REG_RX_FAST_LOCK_SETUP + offs,
 				RX_FAST_LOCK_PROFILE(profile) |
 				RX_FAST_LOCK_MODE_ENABLE);
-		ad9361_spi_write(phy->spi, REG_RX_FAST_LOCK_PROGRAM_CTRL + offs,
+		if (err && !ret)
+			ret = err;
+		err = ad9361_spi_write(phy->spi, REG_RX_FAST_LOCK_PROGRAM_CTRL + offs,
 				0);
+		if (err && !ret)
+			ret = err;
 
-		ad9361_spi_writef(phy->spi, REG_ENSM_CONFIG_2, ready_mask, 1);
-		ad9361_trx_vco_cal_control(phy, tx, false);
+		err = ad9361_spi_writef(phy->spi, REG_ENSM_CONFIG_2, ready_mask, 1);
+		if (err && !ret)
+			ret = err;
+		err = ad9361_trx_vco_cal_control(phy, tx, false);
+		if (err && !ret)
+			ret = err;
 	} else if (!prepare && is_prepared) {
-		ad9361_spi_write(phy->spi, REG_RX_FAST_LOCK_SETUP + offs, 0);
+		err = ad9361_spi_write(phy->spi, REG_RX_FAST_LOCK_SETUP + offs, 0);
+		if (err && !ret)
+			ret = err;
 
 		/* Workaround: Exiting Fastlock Mode */
-		ad9361_spi_writef(phy->spi, REG_RX_FORCE_ALC + offs, FORCE_ALC_ENABLE, 1);
-		ad9361_spi_writef(phy->spi, REG_RX_FORCE_VCO_TUNE_1 + offs, FORCE_VCO_TUNE, 1);
-		ad9361_spi_writef(phy->spi, REG_RX_FORCE_ALC + offs, FORCE_ALC_ENABLE, 0);
-		ad9361_spi_writef(phy->spi, REG_RX_FORCE_VCO_TUNE_1 + offs, FORCE_VCO_TUNE, 0);
+		err = ad9361_spi_writef(phy->spi, REG_RX_FORCE_ALC + offs, FORCE_ALC_ENABLE, 1);
+		if (err && !ret)
+			ret = err;
+		err = ad9361_spi_writef(phy->spi, REG_RX_FORCE_VCO_TUNE_1 + offs, FORCE_VCO_TUNE, 1);
+		if (err && !ret)
+			ret = err;
+		err = ad9361_spi_writef(phy->spi, REG_RX_FORCE_ALC + offs, FORCE_ALC_ENABLE, 0);
+		if (err && !ret)
+			ret = err;
+		err = ad9361_spi_writef(phy->spi, REG_RX_FORCE_VCO_TUNE_1 + offs, FORCE_VCO_TUNE, 0);
+		if (err && !ret)
+			ret = err;
 
-		ad9361_trx_vco_cal_control(phy, tx, true);
-		ad9361_spi_writef(phy->spi, REG_ENSM_CONFIG_2, ready_mask, 0);
+		err = ad9361_trx_vco_cal_control(phy, tx, true);
+		if (err && !ret)
+			ret = err;
+		err = ad9361_spi_writef(phy->spi, REG_ENSM_CONFIG_2, ready_mask, 0);
+		if (err && !ret)
+			ret = err;
 
-		st->fastlock.current_profile[tx] = 0;
+		if (!ret)
+			st->fastlock.current_profile[tx] = 0;
 	}
 
-	return 0;
+	return ret;
 }
 
 static int ad9361_fastlock_recall(struct ad9361_rf_phy *phy, bool tx, u32 profile)
@@ -5361,6 +5480,7 @@ static int ad9361_fastlock_recall(struct ad9361_rf_phy *phy, bool tx, u32 profil
 	struct ad9361_rf_phy_state *st = phy->state;
 	u32 offs = 0;
 	u8 curr, new, orig, current_profile;
+	int ret;
 
 	dev_dbg(&phy->spi->dev, "%s: %s Profile %d:",
 		__func__, tx ? "TX" : "RX", profile);
@@ -5376,10 +5496,13 @@ static int ad9361_fastlock_recall(struct ad9361_rf_phy *phy, bool tx, u32 profil
 	current_profile = st->fastlock.current_profile[tx];
 	new = st->fastlock.entry[tx][profile].alc_written;
 
-	if (current_profile == 0)
-		curr = ad9361_spi_readf(phy->spi, REG_RX_FORCE_ALC + offs,
-				FORCE_ALC_WORD(~0)) << 1;
-	else
+	if (current_profile == 0) {
+		ret = ad9361_spi_readf(phy->spi, REG_RX_FORCE_ALC + offs,
+				      FORCE_ALC_WORD(~0));
+		if (ret < 0)
+			return ret;
+		curr = ret << 1;
+	} else
 		curr = st->fastlock.entry[tx][current_profile - 1].alc_written;
 
 	if ((curr >> 1) == (new >> 1)) {
@@ -5390,11 +5513,15 @@ static int ad9361_fastlock_recall(struct ad9361_rf_phy *phy, bool tx, u32 profil
 		else
 			st->fastlock.entry[tx][profile].alc_written = orig;
 
-		ad9361_fastlock_writeval(phy->spi, tx, profile, 0xF,
+		ret = ad9361_fastlock_writeval(phy->spi, tx, profile, 0xF,
 			st->fastlock.entry[tx][profile].alc_written, true);
+		if (ret)
+			return ret;
 	}
 
-	ad9361_fastlock_prepare(phy, tx, profile, true);
+	ret = ad9361_fastlock_prepare(phy, tx, profile, true);
+	if (ret)
+		return ret;
 	st->fastlock.current_profile[tx] = profile + 1;
 
 	return ad9361_spi_write(phy->spi, REG_RX_FAST_LOCK_SETUP + offs,

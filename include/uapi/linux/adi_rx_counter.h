@@ -53,6 +53,11 @@ struct adi_rx_counter_scan_config {
  * A successful recall returns a source-counter bracket.  The values are the
  * coherent low 32 bits of the same 64-bit ADC sample counter embedded in IQ
  * blocks.  Userspace extends them against the surrounding IQ timestamps.
+ * counter_after is sampled after checked hardware profile selection, profile
+ * frequency/integrity reads and bounded RX PLL lock attestation. frequency_hz
+ * is decoded from the selected profile; AD9361 ordinary RFPLL SPI registers
+ * retain the last conventional tune during Fast Lock and cannot independently
+ * measure the active RF LO. RF tone qualification remains a separate oracle.
  * profile_crc32 is the post-recall value because the AD9361 ALC workaround
  * may legitimately rewrite the profile's ALC word.
  */
