@@ -2346,13 +2346,16 @@ static int ad9361_counter_wait_rx_lock(struct ad9361_rf_phy *phy)
 			ret = status;
 			break;
 		}
-		/* Diagnostic build deliberately retains the deployed deadline rule. */
-		if (ktime_compare(ktime_get(), deadline) > 0) {
-			ret = -ETIMEDOUT;
-			break;
-		}
+		/* A completed read is current positive lock evidence even when SPI
+		 * service or scheduling crossed the polling deadline. The receipt's
+		 * counter_after is sampled later, after all attestation; userspace
+		 * still excludes its measured transition and settling interval. */
 		if (status & VCO_LOCK) {
 			ret = 0;
+			break;
+		}
+		if (ktime_compare(ktime_get(), deadline) > 0) {
+			ret = -ETIMEDOUT;
 			break;
 		}
 		usleep_range(20, 40);
@@ -2665,7 +2668,7 @@ int ad9361_counter_configure_scan(struct ad9361_rf_phy *phy, void *owner,
 	ad9361_counter_diag_operation(phy, ADI_RX_COUNTER_DIAG_CONFIGURE,
 				      phy->counter_diag_profile, started, counter, ret);
 	restore_ret = ad9361_counter_restore_rx_lo(phy);
-	if (restore_ret)
+	if (restore_ret && !ret)
 		ret = restore_ret;
 	if (!ret) {
 		for (i = 0; i < 8; i++) {
@@ -2755,8 +2758,9 @@ fault_restore:
 				      started, counter, ret);
 	phy->counter_scan_configured = false;
 	phy->counter_scan_profile_mask = 0;
-	if (ad9361_counter_restore_rx_lo(phy))
-		ret = -EIO;
+	/* Diagnostics retain restoration separately. Do not replace the error
+	 * that caused this recall to fail. No valid receipt escapes this path. */
+	(void)ad9361_counter_restore_rx_lo(phy);
 out:
 	/* The primary failure was recorded before restoration changed the stage. */
 	if (phy->counter_diag_stage == ADI_RX_COUNTER_DIAG_RECALL)
