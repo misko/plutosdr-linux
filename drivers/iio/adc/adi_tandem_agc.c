@@ -538,6 +538,8 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 	struct adi_rx_counter_scan_caps scan_caps;
 	struct adi_rx_counter_scan_release scan_release;
 	struct adi_rx_counter_scan_snapshot scan_snapshot;
+	struct adi_rx_counter_diag_context diag_context;
+	struct adi_rx_counter_diagnostics *diagnostics;
 	u64 scan_frequency[ADI_RX_COUNTER_SCAN_MAX_PROFILES];
 	u32 scan_crc[ADI_RX_COUNTER_SCAN_MAX_PROFILES];
 	unsigned int i;
@@ -549,11 +551,38 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 	    cmd != ADI_RX_COUNTER_IOC_RECALL &&
 	    cmd != ADI_RX_COUNTER_IOC_GET_SCAN_CAPS &&
 	    cmd != ADI_RX_COUNTER_IOC_RELEASE_SCAN &&
-	    cmd != ADI_RX_COUNTER_IOC_SCAN_SNAPSHOT) {
+	    cmd != ADI_RX_COUNTER_IOC_SCAN_SNAPSHOT &&
+	    cmd != ADI_RX_COUNTER_IOC_DIAG_CONTEXT &&
+	    cmd != ADI_RX_COUNTER_IOC_GET_DIAGNOSTICS) {
 		ret = -EBUSY;
 		goto out_ioctl;
 	}
 	switch (cmd) {
+	case ADI_RX_COUNTER_IOC_DIAG_CONTEXT:
+		if (copy_from_user(&diag_context, argp, sizeof(diag_context))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (diag_context.magic != ADI_RX_COUNTER_MAGIC ||
+		    diag_context.version != ADI_RX_COUNTER_DIAG_VERSION ||
+		    diag_context.size != sizeof(diag_context)) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = ad9361_counter_diag_context(st->phy, st,
+						 diag_context.session, diag_context.visit);
+		break;
+	case ADI_RX_COUNTER_IOC_GET_DIAGNOSTICS:
+		diagnostics = kzalloc(sizeof(*diagnostics), GFP_KERNEL);
+		if (!diagnostics) {
+			ret = -ENOMEM;
+			break;
+		}
+		ad9361_counter_get_diagnostics(st->phy, diagnostics);
+		if (copy_to_user(argp, diagnostics, sizeof(*diagnostics)))
+			ret = -EFAULT;
+		kfree(diagnostics);
+		break;
 	case ADI_RX_COUNTER_IOC_ACQUIRE:
 		if (copy_from_user(&counter, argp, sizeof(counter))) {
 			ret = -EFAULT;

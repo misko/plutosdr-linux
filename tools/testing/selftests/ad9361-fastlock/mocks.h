@@ -6,6 +6,7 @@
 #include <string.h>
 #include <errno.h>
 #include "ad9361_regs.h"
+#include "adi_rx_counter.h"
 typedef uint8_t u8;
 typedef uint32_t u32;
 typedef uint64_t u64;
@@ -35,6 +36,9 @@ struct ad9361_rf_phy { struct ad9361_rf_phy_state *state; struct platform_data *
  void *tandem_owner; u32 counter_scan_profile_mask;
  u64 counter_scan_frequency_hz[8], counter_previous_rx_lo_hz;
  u32 counter_scan_profile_crc[8];
+ struct adi_rx_counter_diagnostics counter_diagnostics;
+ u64 counter_diag_session, counter_diag_visit;
+ u32 counter_diag_stage, counter_diag_profile;
 };
 static struct iio_dev indio;
 static struct axiadc_converter conv={.indio_dev=&indio};
@@ -57,6 +61,7 @@ static unsigned long clk_get_rate(struct clk *x) { return 80000000; }
 static int clk_set_rate(struct clk *x, unsigned long hz) { return 0; }
 static unsigned long ad9361_to_clk(u64 hz) { return hz >> 1; }
 static ktime_t ktime_get(void) { return now; }
+static u64 ktime_get_ns(void) { return now * 1000; }
 static ktime_t ktime_add_us(ktime_t t, int us) { return t+us; }
 static int ktime_compare(ktime_t a, ktime_t b) { return (a>b)-(a<b); }
 static void usleep_range(int low, int high) { now+=high; }

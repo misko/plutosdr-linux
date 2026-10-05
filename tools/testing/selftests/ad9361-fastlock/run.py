@@ -6,11 +6,13 @@ root = Path(__file__).resolve().parents[4]
 source = (root / 'drivers/iio/adc/ad9361.c').read_text()
 def function(name):
     import re
-    match = re.search(r'^(?:static )?(?:int|u64|bool) '+name+r'\([^;]+?\)\n\{', source, re.M)
+    match = re.search(r'^(?:static )?(?:int|u32|u64|bool|void) '+name+r'\([^;]+?\)\n\{', source, re.M)
     assert match, name
     end = source.index('\n}', match.end()) + 2
     return source[match.start():end] + '\n'
 functions = ['ad9361_calc_rfpll_freq', 'ad9361_counter_frequency_matches',
+             'ad9361_counter_diag_record', 'ad9361_counter_diag_counter',
+             'ad9361_counter_diag_operation',
              'ad9361_counter_wait_rx_lock', 'ad9361_counter_profile_rx_lo',
              'ad9361_counter_read_rx_lo', 'ad9361_counter_restore_rx_lo',
              'ad9361_counter_fastlock_recall']
@@ -25,5 +27,6 @@ with tempfile.TemporaryDirectory(prefix='ad9361-fastlock-') as tmp:
     subprocess.run([os.environ.get('HOSTCC','cc'), '-std=gnu11', '-Wall', '-Wextra',
                     '-Werror', '-Wno-unused-parameter', '-Wno-sign-compare',
                     '-fsanitize=undefined', '-I'+str(root/'drivers/iio/adc'),
+                    '-iquote'+str(root/'include/uapi/linux'),
                     str(path/'test.c'), '-o', str(path/'test')], check=True)
     subprocess.run([str(path/'test')],check=True)

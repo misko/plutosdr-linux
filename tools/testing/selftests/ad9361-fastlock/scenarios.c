@@ -62,14 +62,26 @@ int main(void)
  int tests=0;
  /* Stale conventional registers do not reject RF-confirmed working Fast Lock. */
  reset(); u64 hz=0; u32 after=0;
- assert(recall(0,&hz,&after)==0 && hz==1000000000 && after==2);
+ assert(recall(0,&hz,&after)==0 && hz==1000000000 && after==5);
  assert(!restored && phy.counter_scan_configured && crc_reads==2);
  assert(events[nevents-1]==E_COUNTER); tests++;
  /* Same profile still gets a checked receipt when the kernel is called. */
- nevents=0; counters=0; assert(recall(0,&hz,&after)==0 && after==2); tests++;
- nevents=0; counters=0; assert(recall(3,&hz,&after)==0 && after==2); tests++;
+ nevents=0; counters=0; assert(recall(0,&hz,&after)==0 && after==5); tests++;
+ nevents=0; counters=0; assert(recall(3,&hz,&after)==0 && after==5); tests++;
  reset(); unlocked=true; failed(-ETIMEDOUT); assert(now<=2040 && lock_reads>1); tests++;
  reset(); late_lock=true; failed(-EIO); tests++; /* restoration also misses deadline */
+ assert(phy.counter_diagnostics.first_failure.error == -ETIMEDOUT);
+ assert(phy.counter_diagnostics.first_failure.last_status & VCO_LOCK);
+ assert(phy.counter_diagnostics.first_failure.end_ns -
+        phy.counter_diagnostics.first_failure.start_ns == 2001000);
+ assert(phy.counter_diagnostics.restoration_failure.error == -ETIMEDOUT);
+ {
+  struct adi_rx_counter_diag_event event = {.stage=ADI_RX_COUNTER_DIAG_RECALL};
+  for(int i=0;i<64;i++) ad9361_counter_diag_record(&phy,&event);
+  assert(phy.counter_diagnostics.count == ADI_RX_COUNTER_DIAG_CAPACITY);
+  assert(phy.counter_diagnostics.first_failure.error == -ETIMEDOUT);
+  assert(phy.counter_diagnostics.restoration_failure.error == -ETIMEDOUT);tests++;
+ }
  reset(); lock_delay=3; assert(recall(0,&hz,&after)==0 && now==120); tests++;
  reset(); fail_reg=REG_RX_CP_OVERRANGE_VCO_LOCK; failed(-EREMOTEIO); tests++;
  reset(); fail_reg=REG_RX_FAST_LOCK_SETUP; failed(-EREMOTEIO); tests++;

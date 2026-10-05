@@ -121,4 +121,40 @@ struct adi_rx_counter_scan_snapshot {
 	_IOWR('T', 0x24, struct adi_rx_counter_scan_release)
 #define ADI_RX_COUNTER_IOC_SCAN_SNAPSHOT \
 	_IOWR('T', 0x25, struct adi_rx_counter_scan_snapshot)
+
+/* Independent, additive diagnostic ABI. Existing scan structures stay frozen.
+ * Time values use CLOCK_MONOTONIC nanoseconds; counters are raw low 32 bits.
+ * The ring is bounded and survives RELEASE until the next successful ACQUIRE.
+ * sequence orders the circular records; first errors survive ring rollover.
+ */
+#define ADI_RX_COUNTER_DIAG_VERSION 1U
+#define ADI_RX_COUNTER_DIAG_CAPACITY 32U
+#define ADI_RX_COUNTER_DIAG_RECALL 1U
+#define ADI_RX_COUNTER_DIAG_CONFIGURE 2U
+#define ADI_RX_COUNTER_DIAG_RESTORE 3U
+#define ADI_RX_COUNTER_DIAG_OPERATION 0U
+#define ADI_RX_COUNTER_DIAG_LOCK 1U
+struct adi_rx_counter_diag_context {
+	__u32 magic;
+	__u16 version, size;
+	__aligned_u64 session, visit;
+};
+struct adi_rx_counter_diag_event {
+	__aligned_u64 sequence, session, visit;
+	__aligned_u64 start_ns, end_ns, spi_last_ns, spi_max_ns;
+	__u32 stage, step, profile, counter_before, counter_after, polls;
+	__s32 last_status, error;
+};
+struct adi_rx_counter_diagnostics {
+	__u32 magic;
+	__u16 version, size;
+	__u32 count, reserved;
+	__aligned_u64 total;
+	struct adi_rx_counter_diag_event first_failure, restoration_failure;
+	struct adi_rx_counter_diag_event events[ADI_RX_COUNTER_DIAG_CAPACITY];
+};
+#define ADI_RX_COUNTER_IOC_DIAG_CONTEXT \
+	_IOW('T', 0x26, struct adi_rx_counter_diag_context)
+#define ADI_RX_COUNTER_IOC_GET_DIAGNOSTICS \
+	_IOR('T', 0x27, struct adi_rx_counter_diagnostics)
 #endif
