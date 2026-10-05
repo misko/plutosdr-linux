@@ -10,6 +10,7 @@
 #define IIO_FREQUENCY_AD9361_H_
 
 #include <linux/mutex.h>
+#include <linux/adi_rx_counter.h>
 #include "ad9361_regs.h"
 
 enum ad9361_clocks {
@@ -183,6 +184,9 @@ struct ad9361_rf_phy {
 	u32 counter_scan_profile_mask;
 	bool counter_scan_configured;
 	bool counter_scan_restore_required;
+	struct adi_rx_counter_diagnostics counter_diagnostics;
+	u64 counter_diag_session, counter_diag_visit;
+	u32 counter_diag_stage, counter_diag_profile;
 	u8			tandem_snapshot[16];
 
 	struct ad9361_ext_band_ctl	*ext_band_ctl;
@@ -195,6 +199,10 @@ ssize_t ad9361_dig_interface_timing_analysis(struct ad9361_rf_phy *phy,
 int ad9361_hdl_loopback(struct ad9361_rf_phy *phy, bool enable);
 int ad9361_register_axi_converter(struct ad9361_rf_phy *phy);
 struct ad9361_rf_phy* ad9361_spi_to_phy(struct spi_device *spi);
+int ad9361_counter_diag_context(struct ad9361_rf_phy *phy, void *owner,
+			       u64 session, u64 visit);
+void ad9361_counter_get_diagnostics(struct ad9361_rf_phy *phy,
+				  struct adi_rx_counter_diagnostics *result);
 int ad9361_spi_read(struct spi_device *spi, u32 reg);
 int ad9361_spi_write(struct spi_device *spi, u32 reg, u32 val);
 int ad9361_bist_loopback(struct ad9361_rf_phy *phy, unsigned mode);

@@ -62,14 +62,32 @@ int main(void)
  int tests=0;
  /* Stale conventional registers do not reject RF-confirmed working Fast Lock. */
  reset(); u64 hz=0; u32 after=0;
- assert(recall(0,&hz,&after)==0 && hz==1000000000 && after==2);
+ assert(recall(0,&hz,&after)==0 && hz==1000000000 && after==5);
  assert(!restored && phy.counter_scan_configured && crc_reads==2);
  assert(events[nevents-1]==E_COUNTER); tests++;
  /* Same profile still gets a checked receipt when the kernel is called. */
- nevents=0; counters=0; assert(recall(0,&hz,&after)==0 && after==2); tests++;
- nevents=0; counters=0; assert(recall(3,&hz,&after)==0 && after==2); tests++;
+ nevents=0; counters=0; assert(recall(0,&hz,&after)==0 && after==5); tests++;
+ nevents=0; counters=0; assert(recall(3,&hz,&after)==0 && after==5); tests++;
  reset(); unlocked=true; failed(-ETIMEDOUT); assert(now<=2040 && lock_reads>1); tests++;
- reset(); late_lock=true; failed(-EIO); tests++; /* restoration also misses deadline */
+ reset(); late_lock=true;
+ assert(recall(0,&hz,&after)==0 && after==5 && now==2001);
+ assert(!restored && phy.counter_scan_configured);
+ assert(!phy.counter_diagnostics.first_failure.error);
+ assert(phy.counter_diagnostics.events[0].last_status & VCO_LOCK);
+ assert(phy.counter_diagnostics.events[0].spi_last_ns == 2001000);tests++;
+ reset(); late_lock=true; unlocked=true; failed(-ETIMEDOUT);tests++;
+ assert(phy.counter_diagnostics.first_failure.error == -ETIMEDOUT);
+ assert(!(phy.counter_diagnostics.first_failure.last_status & VCO_LOCK));
+ assert(phy.counter_diagnostics.first_failure.end_ns -
+        phy.counter_diagnostics.first_failure.start_ns == 2001000);
+ assert(!phy.counter_diagnostics.restoration_failure.error);
+ {
+  struct adi_rx_counter_diag_event event = {.stage=ADI_RX_COUNTER_DIAG_RECALL};
+  for(int i=0;i<64;i++) ad9361_counter_diag_record(&phy,&event);
+  assert(phy.counter_diagnostics.count == ADI_RX_COUNTER_DIAG_CAPACITY);
+  assert(phy.counter_diagnostics.first_failure.error == -ETIMEDOUT);
+  assert(!phy.counter_diagnostics.restoration_failure.error);tests++;
+ }
  reset(); lock_delay=3; assert(recall(0,&hz,&after)==0 && now==120); tests++;
  reset(); fail_reg=REG_RX_CP_OVERRANGE_VCO_LOCK; failed(-EREMOTEIO); tests++;
  reset(); fail_reg=REG_RX_FAST_LOCK_SETUP; failed(-EREMOTEIO); tests++;
@@ -82,7 +100,10 @@ int main(void)
  reset(); crc_fail_at=2; failed(-EREMOTEIO); tests++;
  reset(); phy.counter_scan_profile_crc[0]^=1; failed(-ESTALE); tests++;
  reset(); recall_error=-EREMOTEIO; failed(-EREMOTEIO); tests++;
- reset(); fail_word=0; restore_error=-EREMOTEIO; failed(-EIO); assert(phy.counter_scan_restore_required); tests++;
+ reset(); fail_word=0; restore_error=-EREMOTEIO; failed(-EREMOTEIO);
+ assert(phy.counter_scan_restore_required);
+ assert(phy.counter_diagnostics.first_failure.error == -EREMOTEIO);
+ assert(phy.counter_diagnostics.restoration_failure.error == -EREMOTEIO); tests++;
  /* Direct register restoration rejects failures and wrong actual frequency. */
  reset(); fail_readm=1; assert(ad9361_counter_restore_rx_lo(&phy)==-EREMOTEIO); tests++;
  reset(); regs[REG_RX_INTEGER_BYTE_0]=99; assert(ad9361_counter_restore_rx_lo(&phy)==-EIO); tests++;

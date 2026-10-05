@@ -2255,21 +2255,115 @@ static unsigned long ad9361_rfpll_recalc_rate(struct clk_hw *hw, unsigned long p
 /* Bound scan attestation independently of the general calibration timeout.
  * SPI failures are errors, never status bits. The PHY lock excludes retuning.
  */
+/* Called under phy->lock. No allocation, printk or persistent I/O per hop. */
+static void ad9361_counter_diag_record(struct ad9361_rf_phy *phy,
+				      struct adi_rx_counter_diag_event *event)
+{
+	struct adi_rx_counter_diagnostics *diag = &phy->counter_diagnostics;
+
+	event->session = phy->counter_diag_session;
+	event->visit = phy->counter_diag_visit;
+	event->sequence = ++diag->total;
+	diag->events[(event->sequence - 1) % ADI_RX_COUNTER_DIAG_CAPACITY] = *event;
+	if (diag->count < ADI_RX_COUNTER_DIAG_CAPACITY)
+		diag->count++;
+	if (event->error && event->stage == ADI_RX_COUNTER_DIAG_RESTORE) {
+		if (!diag->restoration_failure.error)
+			diag->restoration_failure = *event;
+	} else if (event->error && !diag->first_failure.error) {
+		diag->first_failure = *event;
+	}
+}
+
+static u32 ad9361_counter_diag_counter(struct ad9361_rf_phy *phy)
+{
+	struct axiadc_converter *conv = spi_get_drvdata(phy->spi);
+	return axiadc_read(iio_priv(conv->indio_dev), ADI_REG_GP_STATUS);
+}
+
+static void ad9361_counter_diag_operation(struct ad9361_rf_phy *phy,
+					 u32 stage, u32 profile, u64 start_ns,
+					 u32 counter_before, int error)
+{
+	struct adi_rx_counter_diag_event event = {
+		.stage = stage, .profile = profile, .start_ns = start_ns,
+		.end_ns = ktime_get_ns(), .counter_before = counter_before,
+		.counter_after = ad9361_counter_diag_counter(phy),
+		.last_status = -ENODATA, .error = error,
+	};
+	ad9361_counter_diag_record(phy, &event);
+}
+
+int ad9361_counter_diag_context(struct ad9361_rf_phy *phy, void *owner,
+			       u64 session, u64 visit)
+{
+	int ret = 0;
+	mutex_lock(&phy->lock);
+	if (!phy->counter_owned || phy->tandem_owner != owner)
+		ret = -EPERM;
+	else {
+		phy->counter_diag_session = session;
+		phy->counter_diag_visit = visit;
+	}
+	mutex_unlock(&phy->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ad9361_counter_diag_context);
+
+void ad9361_counter_get_diagnostics(struct ad9361_rf_phy *phy,
+				  struct adi_rx_counter_diagnostics *result)
+{
+	mutex_lock(&phy->lock);
+	*result = phy->counter_diagnostics;
+	result->magic = ADI_RX_COUNTER_MAGIC;
+	result->version = ADI_RX_COUNTER_DIAG_VERSION;
+	result->size = sizeof(*result);
+	mutex_unlock(&phy->lock);
+}
+EXPORT_SYMBOL_GPL(ad9361_counter_get_diagnostics);
+
 static int ad9361_counter_wait_rx_lock(struct ad9361_rf_phy *phy)
 {
 	ktime_t deadline = ktime_add_us(ktime_get(), 2000);
-	int status;
+	struct adi_rx_counter_diag_event event = {
+		.stage = phy->counter_diag_stage, .step = ADI_RX_COUNTER_DIAG_LOCK,
+		.profile = phy->counter_diag_profile, .start_ns = ktime_get_ns(),
+		.counter_before = ad9361_counter_diag_counter(phy),
+	};
+	u64 spi_start;
+	int status, ret;
 
 	for (;;) {
+		spi_start = ktime_get_ns();
 		status = ad9361_spi_read(phy->spi, REG_RX_CP_OVERRANGE_VCO_LOCK);
-		if (status < 0)
-			return status;
-		if (ktime_compare(ktime_get(), deadline) > 0)
-			return -ETIMEDOUT;
-		if (status & VCO_LOCK)
-			return 0;
+		event.end_ns = ktime_get_ns();
+		event.spi_last_ns = event.end_ns - spi_start;
+		if (event.spi_last_ns > event.spi_max_ns)
+			event.spi_max_ns = event.spi_last_ns;
+		event.polls++;
+		event.last_status = status;
+		if (status < 0) {
+			ret = status;
+			break;
+		}
+		/* A completed read is current positive lock evidence even when SPI
+		 * service or scheduling crossed the polling deadline. The receipt's
+		 * counter_after is sampled later, after all attestation; userspace
+		 * still excludes its measured transition and settling interval. */
+		if (status & VCO_LOCK) {
+			ret = 0;
+			break;
+		}
+		if (ktime_compare(ktime_get(), deadline) > 0) {
+			ret = -ETIMEDOUT;
+			break;
+		}
 		usleep_range(20, 40);
 	}
+	event.error = ret;
+	event.counter_after = ad9361_counter_diag_counter(phy);
+	ad9361_counter_diag_record(phy, &event);
+	return ret;
 }
 
 static int ad9361_fastlock_readval(struct spi_device *spi, bool tx,
@@ -2362,26 +2456,35 @@ static bool ad9361_counter_frequency_matches(u64 actual, u64 expected)
 static int ad9361_counter_restore_rx_lo(struct ad9361_rf_phy *phy)
 {
 	u64 actual;
+	u64 started = ktime_get_ns();
+	u32 counter = ad9361_counter_diag_counter(phy);
 	int ret;
 
+	phy->counter_diag_stage = ADI_RX_COUNTER_DIAG_RESTORE;
+	phy->counter_diag_profile = ~0U;
 	ret = ad9361_fastlock_prepare(phy, false, 0, false);
 	if (ret)
-		return ret;
+		goto out;
 	ret = clk_set_rate(phy->clks[RX_RFPLL],
 			   ad9361_to_clk(phy->counter_previous_rx_lo_hz));
 	if (ret)
-		return ret;
+		goto out;
 	ret = ad9361_counter_read_rx_lo(phy, &actual);
 	if (ret)
-		return ret;
+		goto out;
 	ret = ad9361_counter_wait_rx_lock(phy);
 	if (ret)
-		return ret;
+		goto out;
 	if (!ad9361_counter_frequency_matches(actual,
-					      phy->counter_previous_rx_lo_hz))
-		return -EIO;
+					      phy->counter_previous_rx_lo_hz)) {
+		ret = -EIO;
+		goto out;
+	}
 	phy->counter_scan_restore_required = false;
-	return 0;
+out:
+	ad9361_counter_diag_operation(phy, ADI_RX_COUNTER_DIAG_RESTORE, ~0U,
+				      started, counter, ret);
+	return ret;
 }
 
 bool ad9361_counter_topology_supported(struct ad9361_rf_phy *phy)
@@ -2460,6 +2563,9 @@ int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_ra
 		goto out;
 	}
 	phy->counter_previous_control = control;
+	memset(&phy->counter_diagnostics, 0, sizeof(phy->counter_diagnostics));
+	phy->counter_diag_session = 0;
+	phy->counter_diag_visit = ~0ULL;
 	phy->counter_previous_rx_lo_hz =
 		ad9361_from_clk(clk_get_rate(phy->clks[RX_RFPLL]));
 	phy->counter_scan_profile_mask = 0;
@@ -2502,6 +2608,8 @@ int ad9361_counter_configure_scan(struct ad9361_rf_phy *phy, void *owner,
 	u32 verified_crc[8] = { 0 };
 	u64 actual;
 	int ret = 0, restore_ret, i;
+	u64 started;
+	u32 counter;
 
 	if (!conv || !conv->indio_dev || !owner || !frequency_hz ||
 	    !profile_crc || !profile_mask || profile_mask & ~GENMASK(7, 0))
@@ -2521,9 +2629,13 @@ int ad9361_counter_configure_scan(struct ad9361_rf_phy *phy, void *owner,
 
 	phy->counter_scan_configured = false;
 	phy->counter_scan_profile_mask = 0;
+	started = ktime_get_ns();
+	counter = ad9361_counter_diag_counter(phy);
+	phy->counter_diag_stage = ADI_RX_COUNTER_DIAG_CONFIGURE;
 	for (i = 0; i < 8; i++) {
 		if (!(profile_mask & BIT(i)))
 			continue;
+		phy->counter_diag_profile = i;
 		if (!frequency_hz[i] ||
 		    phy->state->fastlock.entry[0][i].flags != FASTLOOK_INIT) {
 			ret = -EINVAL;
@@ -2553,8 +2665,10 @@ int ad9361_counter_configure_scan(struct ad9361_rf_phy *phy, void *owner,
 			break;
 	}
 
+	ad9361_counter_diag_operation(phy, ADI_RX_COUNTER_DIAG_CONFIGURE,
+				      phy->counter_diag_profile, started, counter, ret);
 	restore_ret = ad9361_counter_restore_rx_lo(phy);
-	if (restore_ret)
+	if (restore_ret && !ret)
 		ret = restore_ret;
 	if (!ret) {
 		for (i = 0; i < 8; i++) {
@@ -2582,6 +2696,8 @@ int ad9361_counter_fastlock_recall(struct ad9361_rf_phy *phy, void *owner,
 	u64 actual;
 	u32 crc;
 	int ret = 0;
+	u64 started;
+	u32 counter;
 
 	if (!conv || !conv->indio_dev || !owner || !frequency_hz ||
 	    !profile_crc || !counter_before || !counter_after || profile >= 8)
@@ -2591,6 +2707,10 @@ int ad9361_counter_fastlock_recall(struct ad9361_rf_phy *phy, void *owner,
 	mutex_lock(&conv->indio_dev->mlock);
 	mutex_lock(&conv->lock);
 	mutex_lock(&phy->lock);
+	started = ktime_get_ns();
+	counter = ad9361_counter_diag_counter(phy);
+	phy->counter_diag_stage = ADI_RX_COUNTER_DIAG_RECALL;
+	phy->counter_diag_profile = profile;
 	if (!phy->counter_owned || phy->tandem_owner != owner) {
 		ret = -EPERM;
 		goto out;
@@ -2634,11 +2754,18 @@ int ad9361_counter_fastlock_recall(struct ad9361_rf_phy *phy, void *owner,
 	goto out;
 
 fault_restore:
+	ad9361_counter_diag_operation(phy, ADI_RX_COUNTER_DIAG_RECALL, profile,
+				      started, counter, ret);
 	phy->counter_scan_configured = false;
 	phy->counter_scan_profile_mask = 0;
-	if (ad9361_counter_restore_rx_lo(phy))
-		ret = -EIO;
+	/* Diagnostics retain restoration separately. Do not replace the error
+	 * that caused this recall to fail. No valid receipt escapes this path. */
+	(void)ad9361_counter_restore_rx_lo(phy);
 out:
+	/* The primary failure was recorded before restoration changed the stage. */
+	if (phy->counter_diag_stage == ADI_RX_COUNTER_DIAG_RECALL)
+		ad9361_counter_diag_operation(phy, ADI_RX_COUNTER_DIAG_RECALL,
+					      profile, started, counter, ret);
 	mutex_unlock(&phy->lock);
 	mutex_unlock(&conv->lock);
 	mutex_unlock(&conv->indio_dev->mlock);
