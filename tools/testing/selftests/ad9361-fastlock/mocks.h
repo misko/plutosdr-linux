@@ -32,7 +32,7 @@ struct platform_data { unsigned tx_fastlock_delay_ns, rx_fastlock_delay_ns; bool
 #define dev_dbg(...) ((void)0)
 struct ad9361_rf_phy { struct ad9361_rf_phy_state *state; struct platform_data *pdata;
  struct spi_device *spi; struct clk *clks[2]; int lock;
- bool counter_owned, counter_scan_configured, counter_scan_restore_required;
+ bool counter_owned, counter_scan_configured, counter_scan_restore_required, counter_bank_configured;
  void *tandem_owner; u32 counter_scan_profile_mask;
  u64 counter_scan_frequency_hz[8], counter_previous_rx_lo_hz;
  u32 counter_scan_profile_crc[8];

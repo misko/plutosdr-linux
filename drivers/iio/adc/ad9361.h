@@ -184,6 +184,10 @@ struct ad9361_rf_phy {
 	u32 counter_scan_profile_mask;
 	bool counter_scan_configured;
 	bool counter_scan_restore_required;
+	bool counter_bank_configured;
+	struct adi_rx_counter_bank_profile counter_bank[ADI_RX_COUNTER_BANK_TARGETS];
+	u32 counter_bank_target[ADI_RX_COUNTER_BANK_PROFILES];
+	u64 counter_bank_generation[ADI_RX_COUNTER_BANK_PROFILES];
 	struct adi_rx_counter_diagnostics counter_diagnostics;
 	u64 counter_diag_session, counter_diag_visit;
 	u32 counter_diag_stage, counter_diag_profile;
@@ -245,6 +249,10 @@ int ad9361_counter_fastlock_recall(struct ad9361_rf_phy *phy, void *owner,
 				   u32 profile, u64 *frequency_hz,
 				   u32 *profile_crc, u32 *counter_before,
 				   u32 *counter_after);
+int ad9361_counter_configure_bank(struct ad9361_rf_phy *phy, void *owner,
+				   const struct adi_rx_counter_bank_config *config);
+int ad9361_counter_bank_recall(struct ad9361_rf_phy *phy, void *owner,
+				struct adi_rx_counter_bank_recall *request);
 int ad9361_counter_snapshot(struct ad9361_rf_phy *phy, void *owner,
 			    u32 *counter);
 int ad9361_tandem_arm(struct ad9361_rf_phy *phy, void *owner);
