@@ -157,4 +157,60 @@ struct adi_rx_counter_diagnostics {
 	_IOW('T', 0x26, struct adi_rx_counter_diag_context)
 #define ADI_RX_COUNTER_IOC_GET_DIAGNOSTICS \
 	_IOR('T', 0x27, struct adi_rx_counter_diagnostics)
+
+/* Additive bank ABI: legacy scan requests and capability bytes stay frozen.
+ * Profiles are calibrated before streaming; the driver owns an immutable copy.
+ * CONFIGURE_BANK verifies all images, then preloads logical targets 0..7 with
+ * slot generation 1. A physical slot is always logical_target % 8. The owner
+ * serializes replacement/recall with STOP and release on the same descriptor.
+ */
+#define ADI_RX_COUNTER_BANK_VERSION 1U
+#define ADI_RX_COUNTER_BANK_TARGETS 24U
+#define ADI_RX_COUNTER_BANK_PROFILES 8U
+#define ADI_RX_COUNTER_BANK_PROFILE_BYTES 16U
+#define ADI_RX_COUNTER_BANK_FEATURES 0x0fU /* immutable bank, checked load, generations, attestation */
+struct adi_rx_counter_bank_profile {
+	__aligned_u64 frequency_hz;
+	__u32 crc32;
+	__u32 reserved;
+	__u8 values[ADI_RX_COUNTER_BANK_PROFILE_BYTES];
+};
+struct adi_rx_counter_bank_config {
+	__u32 magic;
+	__u16 version, size;
+	__u32 target_count, reserved;
+	struct adi_rx_counter_bank_profile profiles[ADI_RX_COUNTER_BANK_TARGETS];
+};
+struct adi_rx_counter_bank_caps {
+	__u32 magic;
+	__u16 version, size;
+	__u32 features, maximum_targets, maximum_profiles, profile_bytes;
+	__u32 source_counter_bits, reserved;
+};
+/* Input: header, logical_target, profile, expected_generation and requested IF.
+ * All output/reserved words must be zero on input. Generations change only
+ * when a different image replaces a slot; a resident image recall retains its
+ * generation. identity CRC is the original immutable image; profile CRC is
+ * the complete post-recall image, including the legitimate ALC workaround.
+ * counter_before brackets optional loading; load_after follows its checked
+ * readback; recall_before precedes selection; counter_after follows selected
+ * profile/IF verification and PLL lock. Values are coherent low 32-bit ADC
+ * ticks extended against IQ by userspace. No receipt is returned on failure.
+ */
+struct adi_rx_counter_bank_recall {
+	__u32 magic;
+	__u16 version, size;
+	__u32 logical_target, profile;
+	__aligned_u64 expected_generation, requested_frequency_hz;
+	__aligned_u64 slot_generation, frequency_hz;
+	__u32 profile_identity_crc32, profile_crc32;
+	__u32 counter_before, counter_after, load_after, recall_before;
+	__u32 reserved[2];
+};
+#define ADI_RX_COUNTER_IOC_GET_BANK_CAPS \
+	_IOR('T', 0x28, struct adi_rx_counter_bank_caps)
+#define ADI_RX_COUNTER_IOC_CONFIGURE_BANK \
+	_IOW('T', 0x29, struct adi_rx_counter_bank_config)
+#define ADI_RX_COUNTER_IOC_REPLACE_RECALL \
+	_IOWR('T', 0x2a, struct adi_rx_counter_bank_recall)
 #endif

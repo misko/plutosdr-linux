@@ -540,6 +540,9 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 	struct adi_rx_counter_scan_snapshot scan_snapshot;
 	struct adi_rx_counter_diag_context diag_context;
 	struct adi_rx_counter_diagnostics *diagnostics;
+	struct adi_rx_counter_bank_config *bank_config;
+	struct adi_rx_counter_bank_caps bank_caps;
+	struct adi_rx_counter_bank_recall bank_recall;
 	u64 scan_frequency[ADI_RX_COUNTER_SCAN_MAX_PROFILES];
 	u32 scan_crc[ADI_RX_COUNTER_SCAN_MAX_PROFILES];
 	unsigned int i;
@@ -553,11 +556,82 @@ static long tandem_ioctl(struct file *file, unsigned int cmd,
 	    cmd != ADI_RX_COUNTER_IOC_RELEASE_SCAN &&
 	    cmd != ADI_RX_COUNTER_IOC_SCAN_SNAPSHOT &&
 	    cmd != ADI_RX_COUNTER_IOC_DIAG_CONTEXT &&
-	    cmd != ADI_RX_COUNTER_IOC_GET_DIAGNOSTICS) {
+	    cmd != ADI_RX_COUNTER_IOC_GET_DIAGNOSTICS &&
+	    cmd != ADI_RX_COUNTER_IOC_GET_BANK_CAPS &&
+	    cmd != ADI_RX_COUNTER_IOC_CONFIGURE_BANK &&
+	    cmd != ADI_RX_COUNTER_IOC_REPLACE_RECALL) {
 		ret = -EBUSY;
 		goto out_ioctl;
 	}
 	switch (cmd) {
+	case ADI_RX_COUNTER_IOC_GET_BANK_CAPS:
+		if (!ad9361_counter_topology_supported(st->phy)) {
+			ret = -EOPNOTSUPP;
+			break;
+		}
+		memset(&bank_caps, 0, sizeof(bank_caps));
+		bank_caps.magic = ADI_RX_COUNTER_MAGIC;
+		bank_caps.version = ADI_RX_COUNTER_BANK_VERSION;
+		bank_caps.size = sizeof(bank_caps);
+		bank_caps.features = ADI_RX_COUNTER_BANK_FEATURES;
+		bank_caps.maximum_targets = ADI_RX_COUNTER_BANK_TARGETS;
+		bank_caps.maximum_profiles = ADI_RX_COUNTER_BANK_PROFILES;
+		bank_caps.profile_bytes = ADI_RX_COUNTER_BANK_PROFILE_BYTES;
+		bank_caps.source_counter_bits = 32;
+		if (copy_to_user(argp, &bank_caps, sizeof(bank_caps)))
+			ret = -EFAULT;
+		break;
+	case ADI_RX_COUNTER_IOC_CONFIGURE_BANK:
+		if (!st->counter_acquired) {
+			ret = -ENODATA;
+			break;
+		}
+		bank_config = memdup_user(argp, sizeof(*bank_config));
+		if (IS_ERR(bank_config)) {
+			ret = PTR_ERR(bank_config);
+			break;
+		}
+		if (bank_config->magic != ADI_RX_COUNTER_MAGIC ||
+		    bank_config->version != ADI_RX_COUNTER_BANK_VERSION ||
+		    bank_config->size != sizeof(*bank_config) || bank_config->reserved ||
+		    bank_config->target_count != ADI_RX_COUNTER_BANK_TARGETS)
+			ret = -EINVAL;
+		else
+			ret = ad9361_counter_configure_bank(st->phy, st, bank_config);
+		kfree(bank_config);
+		break;
+	case ADI_RX_COUNTER_IOC_REPLACE_RECALL:
+		if (!st->counter_acquired) {
+			ret = -ENODATA;
+			break;
+		}
+		if (copy_from_user(&bank_recall, argp, sizeof(bank_recall))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (bank_recall.magic != ADI_RX_COUNTER_MAGIC ||
+		    bank_recall.version != ADI_RX_COUNTER_BANK_VERSION ||
+		    bank_recall.size != sizeof(bank_recall) ||
+		    !bank_recall.expected_generation || !bank_recall.requested_frequency_hz ||
+		    bank_recall.slot_generation || bank_recall.frequency_hz ||
+		    bank_recall.profile_identity_crc32 || bank_recall.profile_crc32 ||
+		    bank_recall.counter_before || bank_recall.counter_after ||
+		    bank_recall.load_after || bank_recall.recall_before ||
+		    bank_recall.reserved[0] || bank_recall.reserved[1]) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = ad9361_counter_bank_recall(st->phy, st, &bank_recall);
+		if (!ret && copy_to_user(argp, &bank_recall, sizeof(bank_recall))) {
+			int release_ret = ad9361_counter_release(st->phy, st);
+
+			if (!release_ret)
+				st->counter_acquired = false;
+			else
+				st->permanent_fault = true;
+			ret = -EFAULT;
+		}
+		break;
 	case ADI_RX_COUNTER_IOC_DIAG_CONTEXT:
 		if (copy_from_user(&diag_context, argp, sizeof(diag_context))) {
 			ret = -EFAULT;

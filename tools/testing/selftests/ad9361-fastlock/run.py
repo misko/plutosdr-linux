@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compile the production scan helpers against deterministic SPI/clock mocks."""
 from pathlib import Path
-import os, subprocess, tempfile
+import os, subprocess, sys, tempfile
 root = Path(__file__).resolve().parents[4]
 source = (root / 'drivers/iio/adc/ad9361.c').read_text()
 def function(name):
@@ -30,3 +30,4 @@ with tempfile.TemporaryDirectory(prefix='ad9361-fastlock-') as tmp:
                     '-iquote'+str(root/'include/uapi/linux'),
                     str(path/'test.c'), '-o', str(path/'test')], check=True)
     subprocess.run([str(path/'test')],check=True)
+subprocess.run([sys.executable, str(Path(__file__).with_name('test_bank.py'))], check=True)

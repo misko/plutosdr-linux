@@ -2248,6 +2248,8 @@ static int ad9361_fastlock_recall(struct ad9361_rf_phy *phy, bool tx,
 				  u32 profile);
 static int ad9361_fastlock_save(struct ad9361_rf_phy *phy, bool tx,
 				u32 profile, u8 *values);
+static int ad9361_fastlock_load(struct ad9361_rf_phy *phy, bool tx,
+				 u32 profile, const u8 *values);
 static int ad9361_fastlock_prepare(struct ad9361_rf_phy *phy, bool tx,
 				   u32 profile, bool prepare);
 static unsigned long ad9361_rfpll_recalc_rate(struct clk_hw *hw, unsigned long parent_rate);
@@ -2462,6 +2464,11 @@ static int ad9361_counter_restore_rx_lo(struct ad9361_rf_phy *phy)
 
 	phy->counter_diag_stage = ADI_RX_COUNTER_DIAG_RESTORE;
 	phy->counter_diag_profile = ~0U;
+	/* A failed load may leave the profile programming clock enabled. Clear it
+	 * even when selection never entered Fast Lock, before conventional tuning. */
+	ret = ad9361_spi_write(phy->spi, REG_RX_FAST_LOCK_PROGRAM_CTRL, 0);
+	if (ret)
+		goto out;
 	ret = ad9361_fastlock_prepare(phy, false, 0, false);
 	if (ret)
 		goto out;
@@ -2572,6 +2579,8 @@ int ad9361_counter_acquire(struct ad9361_rf_phy *phy, void *owner, u32 sample_ra
 	phy->counter_scan_mask = scan_mask;
 	phy->counter_scan_configured = false;
 	phy->counter_scan_restore_required = false;
+	phy->counter_bank_configured = false;
+	memset(phy->counter_bank_generation, 0, sizeof(phy->counter_bank_generation));
 	phy->tandem_owner = owner;
 	phy->counter_owned = true;
 	conv->counter_capture_owned = true;
@@ -2623,6 +2632,10 @@ int ad9361_counter_configure_scan(struct ad9361_rf_phy *phy, void *owner,
 		goto out;
 	}
 	if (iio_buffer_enabled(conv->indio_dev)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	if (phy->counter_bank_configured) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -2720,6 +2733,10 @@ int ad9361_counter_fastlock_recall(struct ad9361_rf_phy *phy, void *owner,
 		ret = -EINVAL;
 		goto out;
 	}
+	if (phy->counter_bank_configured) {
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
 	ret = ad9361_counter_profile_crc(phy, profile, &crc);
 	if (ret)
 		goto fault_restore;
@@ -2773,6 +2790,235 @@ out:
 }
 EXPORT_SYMBOL_GPL(ad9361_counter_fastlock_recall);
 
+static u64 ad9361_counter_bank_image_frequency(struct ad9361_rf_phy *phy,
+				 const u8 *values)
+{
+	struct clk *clock = phy->clks[RX_RFPLL_INT];
+	u32 fract = (SYNTH_FRACT_WORD(values[4]) << 16) |
+		(values[3] << 8) | values[2];
+	u32 integer = (SYNTH_INTEGER_WORD(values[1]) << 8) | values[0];
+
+	return ad9361_calc_rfpll_freq(clk_get_rate(clk_get_parent(clock)),
+				    integer, fract, values[12] & 0xf);
+}
+
+/* Called with the converter and PHY locks held after selection. Only the
+ * documented ALC word may differ from the immutable calibrated image. */
+static int ad9361_counter_bank_attest(struct ad9361_rf_phy *phy, u32 profile,
+		 const struct adi_rx_counter_bank_profile *image, u64 *frequency,
+		 u32 *crc)
+{
+	u8 values[ADI_RX_COUNTER_BANK_PROFILE_BYTES];
+	int ret;
+
+	ret = ad9361_counter_wait_rx_lock(phy);
+	if (ret)
+		return ret;
+	ret = ad9361_counter_profile_rx_lo(phy, profile, frequency);
+	if (ret)
+		return ret;
+	if (!ad9361_counter_frequency_matches(*frequency, image->frequency_hz))
+		return -ERANGE;
+	ret = ad9361_fastlock_save(phy, false, profile, values);
+	if (ret)
+		return ret;
+	if (memcmp(values, image->values, sizeof(values) - 1) ||
+	    values[15] != phy->state->fastlock.entry[0][profile].alc_written)
+		return -EIO;
+	*crc = crc32_le(~0U, values, sizeof(values)) ^ ~0U;
+	return 0;
+}
+
+int ad9361_counter_configure_bank(struct ad9361_rf_phy *phy, void *owner,
+				 const struct adi_rx_counter_bank_config *config)
+{
+	struct axiadc_converter *conv = spi_get_drvdata(phy->spi);
+	u32 verified_crc[ADI_RX_COUNTER_BANK_PROFILES] = { 0 };
+	u64 actual, started;
+	u32 counter;
+	int i, target, profile, ret = 0, restore_ret;
+
+	if (!conv || !conv->indio_dev || !owner || !config ||
+	    config->target_count != ADI_RX_COUNTER_BANK_TARGETS)
+		return -EINVAL;
+	mutex_lock(&conv->indio_dev->mlock);
+	mutex_lock(&conv->lock);
+	mutex_lock(&phy->lock);
+	if (!phy->counter_owned || phy->tandem_owner != owner) {
+		ret = -EPERM;
+		goto out;
+	}
+	if (iio_buffer_enabled(conv->indio_dev) || phy->counter_scan_configured) {
+		ret = -EBUSY;
+		goto out;
+	}
+	/* Validate the complete bank before the first hardware write. */
+	for (i = 0; i < ADI_RX_COUNTER_BANK_TARGETS; i++) {
+		const struct adi_rx_counter_bank_profile *image = &config->profiles[i];
+
+		if (image->reserved || image->frequency_hz < 70000000ULL ||
+		    image->frequency_hz > 6000000000ULL ||
+		    (crc32_le(~0U, image->values, sizeof(image->values)) ^ ~0U) != image->crc32) {
+			ret = -EINVAL;
+			goto out;
+		}
+		actual = ad9361_counter_bank_image_frequency(phy, image->values);
+		if (!ad9361_counter_frequency_matches(actual, image->frequency_hz)) {
+			ret = -ERANGE;
+			goto out;
+		}
+	}
+	started = ktime_get_ns();
+	counter = ad9361_counter_diag_counter(phy);
+	phy->counter_diag_stage = ADI_RX_COUNTER_DIAG_CONFIGURE;
+	phy->counter_scan_profile_mask = 0;
+	phy->counter_bank_configured = false;
+	/* Attest all 24 images once, then leave targets 0..7 resident. No slot
+	 * mapping is published until the entire preparation and restoration pass. */
+	for (i = 0; i < ADI_RX_COUNTER_BANK_TARGETS + ADI_RX_COUNTER_BANK_PROFILES; i++) {
+		target = i % ADI_RX_COUNTER_BANK_TARGETS;
+		profile = target % ADI_RX_COUNTER_BANK_PROFILES;
+		phy->counter_diag_profile = profile;
+		phy->counter_scan_restore_required = true;
+		ret = ad9361_fastlock_load(phy, false, profile, config->profiles[target].values);
+		if (!ret)
+			ret = ad9361_fastlock_recall(phy, false, profile);
+		if (!ret)
+			ret = ad9361_counter_bank_attest(phy, profile,
+				&config->profiles[target], &actual, &verified_crc[profile]);
+		if (ret)
+			break;
+	}
+	ad9361_counter_diag_operation(phy, ADI_RX_COUNTER_DIAG_CONFIGURE,
+				      phy->counter_diag_profile, started, counter, ret);
+	restore_ret = ad9361_counter_restore_rx_lo(phy);
+	if (!ret)
+		ret = restore_ret;
+	if (!ret) {
+		memcpy(phy->counter_bank, config->profiles, sizeof(phy->counter_bank));
+		for (i = 0; i < ADI_RX_COUNTER_BANK_PROFILES; i++) {
+			phy->counter_bank_target[i] = i;
+			phy->counter_bank_generation[i] = 1;
+			phy->counter_scan_frequency_hz[i] = config->profiles[i].frequency_hz;
+			phy->counter_scan_profile_crc[i] = verified_crc[i];
+		}
+		phy->counter_scan_profile_mask = GENMASK(7, 0);
+		phy->counter_scan_configured = true;
+		phy->counter_bank_configured = true;
+	}
+out:
+	mutex_unlock(&phy->lock);
+	mutex_unlock(&conv->lock);
+	mutex_unlock(&conv->indio_dev->mlock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ad9361_counter_configure_bank);
+
+int ad9361_counter_bank_recall(struct ad9361_rf_phy *phy, void *owner,
+			      struct adi_rx_counter_bank_recall *request)
+{
+	struct axiadc_converter *conv = spi_get_drvdata(phy->spi);
+	struct adi_rx_counter_bank_recall receipt;
+	const struct adi_rx_counter_bank_profile *image;
+	u32 profile, target, crc, counter;
+	u64 actual, generation, started;
+	int ret;
+	bool replace;
+
+	if (!conv || !conv->indio_dev || !owner || !request ||
+	    request->logical_target >= ADI_RX_COUNTER_BANK_TARGETS ||
+	    request->profile != request->logical_target % ADI_RX_COUNTER_BANK_PROFILES)
+		return -EINVAL;
+	profile = request->profile;
+	target = request->logical_target;
+	mutex_lock(&conv->indio_dev->mlock);
+	mutex_lock(&conv->lock);
+	mutex_lock(&phy->lock);
+	if (!phy->counter_owned || phy->tandem_owner != owner) {
+		ret = -EPERM;
+		goto out;
+	}
+	if (!phy->counter_bank_configured || !phy->counter_scan_configured) {
+		ret = -ENODATA;
+		goto out;
+	}
+	started = ktime_get_ns();
+	counter = ad9361_counter_diag_counter(phy);
+	phy->counter_diag_stage = ADI_RX_COUNTER_DIAG_RECALL;
+	phy->counter_diag_profile = profile;
+	image = &phy->counter_bank[target];
+	if (request->expected_generation != phy->counter_bank_generation[profile]) {
+		ret = -ESTALE;
+		goto fault;
+	}
+	if (request->requested_frequency_hz != image->frequency_hz) {
+		ret = -ERANGE;
+		goto fault;
+	}
+	ret = ad9361_counter_profile_crc(phy, profile, &crc);
+	if (ret)
+		goto fault;
+	if (crc != phy->counter_scan_profile_crc[profile]) {
+		ret = -ESTALE;
+		goto fault;
+	}
+	replace = phy->counter_bank_target[profile] != target;
+	generation = phy->counter_bank_generation[profile];
+	if (replace && generation == ~0ULL) {
+		ret = -EOVERFLOW;
+		goto fault;
+	}
+	receipt = *request;
+	receipt.counter_before = ad9361_counter_diag_counter(phy);
+	phy->counter_scan_restore_required = true;
+	if (replace) {
+		phy->counter_scan_profile_mask &= ~BIT(profile);
+		ret = ad9361_fastlock_load(phy, false, profile, image->values);
+		if (ret)
+			goto fault;
+		generation++;
+	}
+	receipt.load_after = ad9361_counter_diag_counter(phy);
+	receipt.recall_before = ad9361_counter_diag_counter(phy);
+	ret = ad9361_fastlock_recall(phy, false, profile);
+	if (ret)
+		goto fault;
+	ret = ad9361_counter_bank_attest(phy, profile, image, &actual, &crc);
+	if (ret)
+		goto fault;
+	receipt.counter_after = ad9361_counter_diag_counter(phy);
+	receipt.slot_generation = generation;
+	receipt.frequency_hz = actual;
+	receipt.profile_identity_crc32 = image->crc32;
+	receipt.profile_crc32 = crc;
+	/* Commit the mapping and caller receipt only after every check succeeds. */
+	phy->counter_bank_target[profile] = target;
+	phy->counter_bank_generation[profile] = generation;
+	phy->counter_scan_frequency_hz[profile] = actual;
+	phy->counter_scan_profile_crc[profile] = crc;
+	phy->counter_scan_profile_mask |= BIT(profile);
+	*request = receipt;
+	ret = 0;
+	goto record;
+fault:
+	ad9361_counter_diag_operation(phy, ADI_RX_COUNTER_DIAG_RECALL, profile,
+				      started, counter, ret);
+	phy->counter_bank_configured = false;
+	phy->counter_scan_configured = false;
+	phy->counter_scan_profile_mask = 0;
+	(void)ad9361_counter_restore_rx_lo(phy);
+	goto out;
+record:
+	ad9361_counter_diag_operation(phy, ADI_RX_COUNTER_DIAG_RECALL, profile,
+				      started, counter, ret);
+out:
+	mutex_unlock(&phy->lock);
+	mutex_unlock(&conv->lock);
+	mutex_unlock(&conv->indio_dev->mlock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ad9361_counter_bank_recall);
+
 int ad9361_counter_snapshot(struct ad9361_rf_phy *phy, void *owner,
 			    u32 *counter)
 {
@@ -2825,6 +3071,7 @@ static int __ad9361_counter_release(struct ad9361_rf_phy *phy, void *owner,
 	conv->counter_capture_owned = false;
 	conv->counter_capture_scan_mask = 0;
 	phy->counter_scan_configured = false;
+	phy->counter_bank_configured = false;
 	phy->counter_scan_restore_required = false;
 	phy->counter_scan_profile_mask = 0;
 	phy->counter_owned = false;
@@ -5424,11 +5671,11 @@ static int ad9361_fastlock_writeval(struct spi_device *spi, bool tx,
 }
 
 static int ad9361_fastlock_load(struct ad9361_rf_phy *phy, bool tx,
-				u32 profile, u8 *values)
+				u32 profile, const u8 *values)
 {
 	struct ad9361_rf_phy_state *st = phy->state;
 	u32 offs = 0;
-	int i, ret = 0;
+	int i, ret, stop_ret;
 	u8 buf[4];
 
 	dev_dbg(&phy->spi->dev, "%s: %s Profile %d:",
@@ -5436,28 +5683,48 @@ static int ad9361_fastlock_load(struct ad9361_rf_phy *phy, bool tx,
 
 	if (tx)
 		offs = REG_TX_FAST_LOCK_SETUP - REG_RX_FAST_LOCK_SETUP;
+	if (profile >= 8)
+		return -EINVAL;
+	/* A partial program must never leave the old mapping usable. */
+	st->fastlock.entry[tx][profile].flags = 0;
 
 	buf[0] = values[0];
 	buf[1] = RX_FAST_LOCK_PROFILE_ADDR(profile) | RX_FAST_LOCK_PROFILE_WORD(0);
-	ad9361_spi_writem(phy->spi, REG_RX_FAST_LOCK_PROGRAM_DATA + offs, buf, 2);
+	ret = ad9361_spi_writem(phy->spi, REG_RX_FAST_LOCK_PROGRAM_DATA + offs, buf, 2);
+	if (ret)
+		goto stop;
 
 	for (i = 1; i < RX_FAST_LOCK_CONFIG_WORD_NUM; i++) {
 		buf[0] = RX_FAST_LOCK_PROGRAM_WRITE | RX_FAST_LOCK_PROGRAM_CLOCK_ENABLE;
 		buf[1] = 0;
 		buf[2] = values[i];
 		buf[3] = RX_FAST_LOCK_PROFILE_ADDR(profile) | RX_FAST_LOCK_PROFILE_WORD(i);
-		ad9361_spi_writem(phy->spi, REG_RX_FAST_LOCK_PROGRAM_CTRL + offs, buf, 4);
+		ret = ad9361_spi_writem(phy->spi, REG_RX_FAST_LOCK_PROGRAM_CTRL + offs, buf, 4);
+		if (ret)
+			goto stop;
 	}
 
-	ad9361_spi_write(phy->spi, REG_RX_FAST_LOCK_PROGRAM_CTRL + offs,
+	ret = ad9361_spi_write(phy->spi, REG_RX_FAST_LOCK_PROGRAM_CTRL + offs,
 			 RX_FAST_LOCK_PROGRAM_WRITE | RX_FAST_LOCK_PROGRAM_CLOCK_ENABLE);
-	ad9361_spi_write(phy->spi, REG_RX_FAST_LOCK_PROGRAM_CTRL + offs, 0);
+stop:
+	stop_ret = ad9361_spi_write(phy->spi, REG_RX_FAST_LOCK_PROGRAM_CTRL + offs, 0);
+	if (ret)
+		return ret;
+	if (stop_ret)
+		return stop_ret;
+	for (i = 0; i < RX_FAST_LOCK_CONFIG_WORD_NUM; i++) {
+		ret = ad9361_fastlock_readval(phy->spi, tx, profile, i);
+		if (ret < 0)
+			return ret;
+		if (ret != values[i])
+			return -EIO;
+	}
 
 	st->fastlock.entry[tx][profile].flags = FASTLOOK_INIT;
 	st->fastlock.entry[tx][profile].alc_orig = values[15];
 	st->fastlock.entry[tx][profile].alc_written = values[15];
 
-	return ret;
+	return 0;
 }
 
 static int ad9361_fastlock_store(struct ad9361_rf_phy *phy, bool tx, u32 profile)
